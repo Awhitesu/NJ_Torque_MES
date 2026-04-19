@@ -8,8 +8,6 @@ import ApiDetail from './components/ApiDetail.vue'
 import type { ApiRecord } from './components/ApiDetail.vue'
 import MaterialScanner from './components/MaterialScanner.vue'
 import TorqueInteraction from './components/TorqueInteraction.vue'
-import SimulatorControl from './components/SimulatorControl.vue'
-import { MOCK_ORDER_INFO, MOCK_ROUTE_DATA } from './utils/mockData'
 
 const CONFIG_KEY = 'mes_app_config_v2'
 const DEFAULT_CONFIG: AppConfig = {
@@ -52,6 +50,8 @@ const apiRecords = ref<ApiRecord[]>([])
 const activeTab = ref<'route' | 'api' | 'log' | 'material' | 'torque'>('route')
 
 const torqueInteractionRef = ref<any>(null)
+const materialVerificationLoading = ref(false)
+const materialVerificationSuccess = ref(false)
 
 function addLog(level: any, msg: string) {
   logs.value.unshift({ time: new Date().toLocaleTimeString(), level, msg })
@@ -59,9 +59,11 @@ function addLog(level: any, msg: string) {
 }
 
 function resetAll() {
-  orderInfo.value = null; orderError.value = ''; routeSteps.value = [];
+  orderError.value = ''; routeSteps.value = [];
   routeError.value = ''; testResult.value = 'IDLE'; resultMessage.value = '';
   apiRecords.value = [];
+  materialVerificationSuccess.value = false;
+  materialVerificationLoading.value = false;
 }
 
 async function handleScan() {
@@ -71,22 +73,10 @@ async function handleScan() {
   addLog('info', `开始查询工单: ${code}`)
   orderLoading.value = true
   const t0 = Date.now()
-  const rec: ApiRecord = { title: '获取工单', url: config.orderApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: { code } }
+  const rec = reactive<ApiRecord>({ title: '获取工单', url: config.orderApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: { code } })
   apiRecords.value.unshift(rec)
   activeTab.value = 'api'
   try {
-    // 【仿真逻辑】：如果以 MOCK- 开头，直接使用模拟数据
-    if (code.toUpperCase().startsWith('MOCK-')) {
-      await new Promise(r => setTimeout(r, 800)) // 模拟网络延迟
-      rec.duration = Date.now() - t0
-      rec.resBody = { code: 200, datas: [MOCK_ORDER_INFO] }
-      rec.status = 'success'
-      orderInfo.value = MOCK_ORDER_INFO
-      addLog('success', '[仿真] 模拟工单获取成功')
-      await fetchRouteList(MOCK_ORDER_INFO.route_No)
-      return
-    }
-
     const res = await getOrderByProcess(config, code)
     rec.duration = Date.now() - t0
     rec.resBody = res
@@ -106,22 +96,9 @@ async function handleScan() {
 async function fetchRouteList(routeCode: string) {
   routeLoading.value = true
   const t0 = Date.now()
-  const rec: ApiRecord = { title: '获取工步', url: config.routeApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: { routeCode } }
+  const rec = reactive<ApiRecord>({ title: '获取工步', url: config.routeApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: { routeCode } })
   apiRecords.value.unshift(rec)
   try {
-    // 【仿真逻辑】：只有当产品条码是 MOCK- 开头时，才使用模拟数据
-    if (productCode.value.toUpperCase().startsWith('MOCK-')) {
-       await new Promise(r => setTimeout(r, 500))
-       rec.duration = Date.now() - t0
-       rec.resBody = MOCK_ROUTE_DATA
-       const steps = MOCK_ROUTE_DATA.data.workSeqList
-       routeSteps.value = steps
-       generateTasks(steps)
-       rec.status = 'success'; addLog('success', '[仿真] 模拟工艺路线获取成功')
-       activeTab.value = 'material'
-       return
-    }
-
     const res = await getRouteList(config, routeCode)
     rec.duration = Date.now() - t0
     rec.resBody = res
@@ -176,55 +153,92 @@ function generateTasks(steps: RouteStep[]) {
   tighteningTasks.value = newTasks
 }
 
-// 步骤三：全物料验证
+function handleSingleMaterialScan(material: { productCode: string, productCount: number }) {
+  const rec: ApiRecord = {
+    title: '单物料扫描验证',
+    url: 'LOCAL_MATCH',
+    status: 'success',
+    time: new Date().toLocaleTimeString(),
+    reqBody: material,
+    resBody: { message: '匹配成功', code: 200 }
+  }
+  apiRecords.value.unshift(rec)
+}
+
 async function handleMaterialComplete(materials: { productCode: string, productCount: number }[]) {
-  if (!orderInfo.value) return
+  if (!orderInfo.value || materialVerificationLoading.value || materialVerificationSuccess.value) {
+    console.warn('[调试] 验证已在进行中或已成功，跳过重复触发')
+    return
+  }
+  
+  materialVerificationLoading.value = true
+  materialVerificationSuccess.value = false
   
   addLog('info', '正在提交全物料验证...')
   const t0 = Date.now()
+
   const reqData = {
-    produceOrderCode: orderInfo.value.orderCode,
-    routeNo: orderInfo.value.route_No,
+    produceOrderCode: orderInfo.value.orderCode || orderInfo.value.order_Code || '',
+    routeNo: orderInfo.value.route_No || orderInfo.value.routeNo || '',
     technicsProcessCode: config.technicsProcessCode,
     tenantID: 'FD',
-    productMixCode: orderInfo.value.productMixCode || 'null',
-    productLine: orderInfo.value.productline_no || '',
+    productMixCode: orderInfo.value.productMixCode || orderInfo.value.product_MixCode || 'null',
+    productLine: "",
     materialList: materials
   }
   
-  const rec: ApiRecord = { title: '全物料验证', url: `${config.orderApiUrl}/../ProduceMessage/CompleteCheckInput`, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: reqData }
+  console.log('[调试] 全物料验证请求体:', JSON.stringify(reqData, null, 2))
+
+  const rec = reactive<ApiRecord>({ title: '全物料验证', url: '/mes-api/api/ProduceMessage/CompleteCheckInput', status: 'pending', time: new Date().toLocaleTimeString(), reqBody: reqData })
   apiRecords.value.unshift(rec)
   
+  testResult.value = 'IDLE'
+  resultMessage.value = '正在进行全物料后台验证...'
+  
   try {
-    // 仿真拦截
-    if (productCode.value.toUpperCase().startsWith('MOCK-')) {
-      await new Promise(r => setTimeout(r, 600))
-      rec.status = 'success'
-      addLog('success', '[仿真] 全物料验证通过！准备开始定扭...')
-      startTighteningWorkflow()
-      return
-    }
+    addLog('info', `[流程] 正在向后台提交真实物料验证 (条码: ${productCode.value})`)
 
+
+    addLog('info', `[调试] 进入真实 API 验证逻辑 (条码: ${productCode.value})`)
     const res = await completeCheckInput(config, reqData)
     rec.duration = Date.now() - t0
     rec.resBody = res
-    // 假设非抛错即为成功，或者检查 res.code
-    rec.status = 'success'
-    addLog('success', '全物料验证通过！准备开始定扭...')
-    testResult.value = 'OK'
-    resultMessage.value = '物料绑定全部成功，准备定扭'
-    startTighteningWorkflow()
+    
+    addLog('info', `[调试] 收到验证回复: ${JSON.stringify(res)}`)
+    
+    if (res && (res.code === 200 || res.code === "200" || res.success === true || res.msg === '操作成功')) {
+      rec.status = 'success'
+      addLog('success', '✅ 全物料验证通过！')
+      materialVerificationSuccess.value = true
+      testResult.value = 'OK'
+      resultMessage.value = '物料验证成功，正在切换至定扭交互...'
+      
+      setTimeout(() => {
+        if (materialVerificationSuccess.value) {
+          startTighteningWorkflow()
+        }
+      }, 1500)
+    } else {
+      rec.status = 'error'
+      const msg = res?.message || res?.msg || '未知错误'
+      addLog('error', `❌ 全物料验证失败: ${msg}`)
+      testResult.value = 'NG'
+      resultMessage.value = `全物料验证未通过: ${msg}`
+      alert(`全物料验证失败！\n原因: ${msg}\n请处理后再继续。`)
+    }
   } catch (err: any) {
     rec.status = 'error'
     testResult.value = 'NG'
-    resultMessage.value = '物料验证失败'
-    addLog('error', `物料验证失败: ${err.message}`)
-    alert(`全物料验证失败，请检查。\n错误信息: ${err.message}`)
+    resultMessage.value = `请求异常: ${err.message}`
+    addLog('error', `❌ 全物料验证请求异常: ${err.message}`)
+    alert(`全物料验证接口请求失败，请检查网络或配置。\n${err.message}`)
+  } finally {
+    materialVerificationLoading.value = false
   }
 }
 
-// 开始自动定扭流程
 function startTighteningWorkflow() {
+  addLog('info', '[流程] 🚀 正在激活定扭交互组件...')
   activeTab.value = 'torque'
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.executeNextPendingTask()
@@ -233,11 +247,9 @@ function startTighteningWorkflow() {
   }
 }
 
-// 定扭单步失败处理
 function handleTaskFailed(failedTask: TighteningTask) {
   const MAX_RETRIES = 3
   
-  // 找到真正的响应式任务对象
   const task = tighteningTasks.value.find(t => t.id === failedTask.id)
   if (!task) return
 
@@ -255,7 +267,6 @@ function handleTaskFailed(failedTask: TighteningTask) {
       task.actualTorque = null
       task.actualAngle = null
       
-      // 清除大标题的 NG 状态
       testResult.value = 'IDLE'
       resultMessage.value = `正在重试: ${task.itemDisplayName}...`
       
@@ -278,61 +289,18 @@ function handleTaskFailed(failedTask: TighteningTask) {
   }
 }
 
-// 所有定扭完成
 function handleAllTasksComplete() {
   testResult.value = 'OK'
   resultMessage.value = '全部工步执行完毕，等待数据上传'
   addLog('success', '🎉 当前产品所有定扭任务已完成！等待结果上传逻辑...')
-  // TODO: 上传结果
 }
 
-// 处理仿真产生的定扭结果
-function handleMockTorque(data: { torque: string, angle: string, status: string }) {
-  const updatedTasks = JSON.parse(JSON.stringify(tighteningTasks.value)) as TighteningTask[]
-  const nextIdx = updatedTasks.findIndex(t => t.result === 'PENDING')
-  
-  if (nextIdx !== -1) {
-    const task = updatedTasks[nextIdx]
-    const now = new Date()
-    const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
-    const isPass = data.status === 'OK'
-
-    // 保存到历史
-    task.history.push({
-      torque: data.torque,
-      angle: data.angle,
-      result: isPass ? 'PASS' : 'FAIL',
-      timestamp: timestamp
-    })
-
-    task.actualTorque = data.torque
-    task.actualAngle = data.angle
-    task.timestamp = timestamp
-    task.result = isPass ? 'PASS' : 'FAIL'
-    
-    tighteningTasks.value = updatedTasks
-    addLog('success', `[仿真结果] ${task.itemDisplayName}: ${data.torque}Nm / ${data.angle}Deg [${data.status}]`)
-
-    if (task.result === 'FAIL') {
-      handleTaskFailed(task)
-    } else {
-      addLog('info', `[仿真流程] 拧紧成功，即将执行下一个...`)
-      setTimeout(() => {
-        if (torqueInteractionRef.value) {
-          torqueInteractionRef.value.executeNextPendingTask()
-        }
-      }, 500)
-    }
-  }
-}
 
 function resetResult() {
   testResult.value = 'IDLE'
   resultMessage.value = ''
-  // 中止定扭流程中的等待循环（如果正在等待连接）
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.abortWorkflow()
-    // 稍后清除中止标志，以便下次流程可以正常启动
     setTimeout(() => torqueInteractionRef.value?.resetWorkflow(), 100)
   }
   addLog('info', '状态已复位，等待下一件')
@@ -341,7 +309,6 @@ function resetResult() {
 
 <template>
   <div class="app-root">
-    <!-- 顶部标题栏 -->
     <header class="app-header">
       <div class="header-left">
         <div class="brand-icon">MES</div>
@@ -363,12 +330,9 @@ function resetResult() {
       </div>
     </header>
 
-    <!-- 主体内容 -->
     <main class="app-main">
-      <!-- 左边：操作区 -->
       <section class="left-panel">
 
-        <!-- 扫码输入区 -->
         <div class="card scan-card">
           <div class="card-title">
             <span class="step-badge">1</span>
@@ -396,7 +360,6 @@ function resetResult() {
           <p class="scan-hint">扫描后请按 <kbd>Enter</kbd> 提交</p>
         </div>
 
-        <!-- 工单信息区 -->
         <div class="card info-card">
           <div class="card-title">
             <span class="step-badge">2</span>
@@ -421,7 +384,6 @@ function resetResult() {
               <span class="info-label">产品条码</span>
               <span class="info-value mono">{{ productCode }}</span>
             </div>
-            <!-- 显示其他返回字段 -->
             <template v-for="(val, key) in orderInfo" :key="key">
               <div
                 v-if="key !== 'orderCode' && key !== 'route_No'"
@@ -436,7 +398,6 @@ function resetResult() {
           <div v-else class="empty-hint">等待扫码查询...</div>
         </div>
 
-        <!-- 状态及进度展示区域 -->
         <div class="card result-card">
           <div class="card-title">
             <span class="step-badge">3</span>
@@ -461,17 +422,8 @@ function resetResult() {
             🔄 复位状态 / 准备下一件
           </button>
         </div>
-
-        <!-- 仿真工具区 -->
-        <SimulatorControl 
-          v-model:productCode="productCode"
-          :tasks="tighteningTasks"
-          @log="addLog"
-          @mockTorque="handleMockTorque"
-        />
       </section>
 
-      <!-- 右边：标签页数据区 -->
       <section class="right-panel">
         <!-- 标签栏 -->
         <div class="tab-bar">
@@ -527,11 +479,25 @@ function resetResult() {
 
           <!-- 物料验证 -->
           <div v-show="activeTab === 'material'" class="tab-pane flex-column">
+            <div v-if="materialVerificationLoading" class="status-banner loading-mini">
+              <span class="spinner-icon">⏳</span>
+              <span>正在向后台提交全物料验证，请稍候...</span>
+            </div>
+            <div v-if="materialVerificationSuccess && activeTab === 'material'" class="status-banner success-mini">
+              <span class="pulse-icon">✅</span>
+              <span>全物料后台验证已通过，即将进入定扭环节...</span>
+            </div>
+            <div v-if="testResult === 'NG' && activeTab === 'material'" class="status-banner fail-mini">
+              <span class="pulse-icon">❌</span>
+              <span>物料验证异常: {{ resultMessage }}</span>
+            </div>
             <MaterialScanner 
               :steps="routeSteps" 
               @log="addLog"
+              @single-complete="handleSingleMaterialScan"
               @complete="handleMaterialComplete"
             />
+
 
             <!-- 定扭判定矩阵表格 (已按需移动至物料下方) -->
             <div class="tightening-matrix-card-modern">
@@ -808,6 +774,16 @@ function resetResult() {
   color: #90caf9;
   background: rgba(100, 181, 246, 0.05);
 }
+.tab-btn.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.8);
+}
+.tab-btn.disabled:hover {
+  background: transparent;
+  color: inherit;
+}
+
 
 .tab-btn.active {
   color: #42a5f5;
@@ -1230,6 +1206,59 @@ kbd {
   padding: 16px;
 }
 
+.status-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-weight: 600;
+  font-size: 14px;
+  animation: slideDown 0.3s ease-out;
+}
+.success-mini {
+  background: rgba(0, 230, 118, 0.1);
+  border: 1px solid rgba(0, 230, 118, 0.2);
+  color: #00e676;
+}
+.fail-mini {
+  background: rgba(244, 67, 54, 0.1);
+  border: 1px solid rgba(244, 67, 54, 0.2);
+  color: #f44336;
+}
+.loading-mini {
+  background: rgba(255, 152, 0, 0.1);
+  border: 1px solid rgba(255, 152, 0, 0.2);
+  color: #ff9800;
+}
+.pulse-icon {
+  font-size: 18px;
+  animation: pulse 2s infinite;
+}
+.spinner-icon {
+  font-size: 18px;
+  display: inline-block;
+  animation: rotate 2s linear infinite;
+}
+
+@keyframes rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse {
+  0% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.1); opacity: 0.8; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+
 /* 定扭判定矩阵 (瀵归綈物料验证 UI) */
 .tightening-matrix-card-modern {
   margin-top: 24px;
@@ -1354,7 +1383,7 @@ kbd {
 
 .matrix-table-wrap {
   flex: 1;
-  max-height: 350px;
+  max-height: 500px;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: rgba(100, 181, 246, 0.2) transparent;

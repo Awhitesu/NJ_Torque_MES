@@ -291,6 +291,8 @@ defineExpose({
     workflowAborted.value = true
     logLocal('info', '[流程] 用户已复位，流程终止。')
     statusText.value = '已复位，等待下一件'
+    workflowStatus.value = '等待流程开启...'
+    currentPSet.value = '-'
   },
   resumeTighteningWorkflow: async () => {
     logLocal('info', `[流程] 人工确认完毕，等待 2s 后继续...`)

@@ -128,27 +128,19 @@ function formatJson(val: unknown): string {
 
 .records-wrap {
   flex: 1;
-  overflow-y: auto;
+  overflow-y: auto !important;
   padding: 10px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.records-wrap::-webkit-scrollbar {
-  width: 4px;
-}
-.records-wrap::-webkit-scrollbar-thumb {
-  background: rgba(100, 181, 246, 0.2);
-  border-radius: 2px;
-}
-
 /* 记录卡片 */
 .record-card {
   border-radius: 8px;
-  overflow: hidden;
   border: 1px solid rgba(100, 181, 246, 0.1);
   background: #0d1117;
+  margin-bottom: 2px;
 }
 
 .record-card.success {
@@ -164,7 +156,7 @@ function formatJson(val: unknown): string {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 9px 14px;
+  padding: 12px 14px;
   cursor: pointer;
   background: rgba(255, 255, 255, 0.02);
   transition: background 0.15s;
@@ -288,24 +280,16 @@ function formatJson(val: unknown): string {
 .code-block {
   background: #060a10;
   border-radius: 6px;
-  padding: 10px 12px;
+  padding: 12px;
   font-family: 'Consolas', monospace;
-  font-size: 11px;
-  line-height: 1.6;
-  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto !important;
+  max-height: 400px;
   white-space: pre;
   margin: 0;
-  max-height: 240px;
-  overflow-y: auto;
-  border: 1px solid rgba(100, 181, 246, 0.08);
-}
-
-.code-block::-webkit-scrollbar {
-  width: 3px;
-  height: 3px;
-}
-.code-block::-webkit-scrollbar-thumb {
-  background: rgba(100, 181, 246, 0.15);
+  border: 1px solid rgba(100, 181, 246, 0.1);
+  color: #eceff1;
 }
 
 .code-block.req  { color: #80cbc4; }
@@ -317,3 +301,4 @@ function formatJson(val: unknown): string {
   50% { opacity: 0.4; }
 }
 </style>
+

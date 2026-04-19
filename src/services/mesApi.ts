@@ -68,8 +68,7 @@ export async function completeCheckInput(
   config: AppConfig,
   data: CompleteCheckInputRequest
 ): Promise<any> {
-  // Extract base URL from orderApiUrl, assuming orderApiUrl starts with the same proxy prefix
-  // Since vite.config.ts uses '/mes-api' proxy which points to the server, we just use the proxy prefix
   const baseUrl = '/mes-api'
   return postRequest<any>(`${baseUrl}/api/ProduceMessage/CompleteCheckInput`, data)
 }
+

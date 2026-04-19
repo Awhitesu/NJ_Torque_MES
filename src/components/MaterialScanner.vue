@@ -8,6 +8,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'complete', materials: { productCode: string, productCount: number }[]): void
+  (e: 'single-complete', material: { productCode: string, productCount: number }): void
   (e: 'log', level: 'info'|'success'|'warn'|'error', msg: string): void
 }>()
 
@@ -79,13 +80,7 @@ const isAllCompleted = computed(() => {
   return taskList.value.every(t => t.status === 'completed')
 })
 
-// 添加仿真支持：监听全局条码事件
-onMounted(() => {
-  window.addEventListener('mock:barcode', ((e: CustomEvent) => {
-    scanInput.value = e.detail
-    handleScan()
-  }) as EventListener)
-})
+
 
 function handleScan() {
   const code = scanInput.value.trim()
@@ -109,13 +104,16 @@ function handleScan() {
     target.scannedCount++
     target.scannedBarcodes.push(code)
     
-    // 如果数量达成，置为完成
     if (target.scannedCount >= target.material_number) {
       target.status = 'completed'
       emit('log', 'success', `物料扫描匹配成功: ${target.material_Name} (全部完成)`)
     } else {
       emit('log', 'success', `物料扫描匹配成功: ${target.material_Name} (${target.scannedCount}/${target.material_number})`)
     }
+    
+    // 发送单次验证记录事件
+    emit('single-complete', { productCode: code, productCount: 1 })
+
     
     // 检查是否全局完成
     if (isAllCompleted.value) {
