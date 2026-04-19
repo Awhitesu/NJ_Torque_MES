@@ -7,7 +7,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'complete'): void
+  (e: 'complete', materials: { productCode: string, productCount: number }[]): void
   (e: 'log', level: 'info'|'success'|'warn'|'error', msg: string): void
 }>()
 
@@ -120,7 +120,14 @@ function handleScan() {
     // 检查是否全局完成
     if (isAllCompleted.value) {
       emit('log', 'success', '🎉 所有物料验证已全部通过！')
-      emit('complete') // 通知主界面
+      
+      const payloadMats = taskList.value.flatMap(t => 
+        t.scannedBarcodes.map(code => ({
+          productCode: code,
+          productCount: 1
+        }))
+      )
+      emit('complete', payloadMats) // 通知主界面并传递物料清单
     }
   } else {
     emit('log', 'error', `扫码无匹配物料或该物料已扫完: ${code}`)

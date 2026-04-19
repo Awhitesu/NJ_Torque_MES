@@ -153,3 +153,18 @@ export interface TighteningTask {
   result: 'PENDING' | 'PASS' | 'FAIL' // 判定结果
   timestamp?: string      // 采集时间
 }
+
+export interface MaterialItem {
+  productCode: string
+  productCount: number
+}
+
+export interface CompleteCheckInputRequest {
+  produceOrderCode: string
+  routeNo: string
+  technicsProcessCode: string
+  tenantID: string
+  productMixCode: string | null
+  productLine: string
+  materialList: MaterialItem[]
+}

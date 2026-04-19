@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, nextTick } from 'vue'
 import type { AppConfig, OrderInfo, RouteStep, TestResult, WorkStep, TighteningTask } from './types/mes'
-import { getOrderByProcess, getRouteList } from './services/mesApi'
-import { writeSignal, clearSignal } from './utils/labviewSignal'
+import { getOrderByProcess, getRouteList, completeCheckInput } from './services/mesApi'
 import ConfigModal from './components/ConfigModal.vue'
 import RouteTable from './components/RouteTable.vue'
 import ApiDetail from './components/ApiDetail.vue'
@@ -52,6 +51,8 @@ const logs = ref<any[]>([])
 const apiRecords = ref<ApiRecord[]>([])
 const activeTab = ref<'route' | 'api' | 'log' | 'material' | 'torque'>('route')
 
+const torqueInteractionRef = ref<any>(null)
+
 function addLog(level: any, msg: string) {
   logs.value.unshift({ time: new Date().toLocaleTimeString(), level, msg })
   if (logs.value.length > 50) logs.value.pop()
@@ -60,7 +61,7 @@ function addLog(level: any, msg: string) {
 function resetAll() {
   orderInfo.value = null; orderError.value = ''; routeSteps.value = [];
   routeError.value = ''; testResult.value = 'IDLE'; resultMessage.value = '';
-  apiRecords.value = []; clearSignal();
+  apiRecords.value = [];
 }
 
 async function handleScan() {
@@ -108,8 +109,8 @@ async function fetchRouteList(routeCode: string) {
   const rec: ApiRecord = { title: '获取工步', url: config.routeApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: { routeCode } }
   apiRecords.value.unshift(rec)
   try {
-    // 【仿真逻辑】
-    if (routeCode === 'ROUTE_BASE_001') {
+    // 【仿真逻辑】：只有当产品条码是 MOCK- 开头时，才使用模拟数据
+    if (productCode.value.toUpperCase().startsWith('MOCK-')) {
        await new Promise(r => setTimeout(r, 500))
        rec.duration = Date.now() - t0
        rec.resBody = MOCK_ROUTE_DATA
@@ -173,18 +174,81 @@ function generateTasks(steps: RouteStep[]) {
   tighteningTasks.value = newTasks
 }
 
-function setOK() {
-  testResult.value = 'OK'
-  resultMessage.value = '测试综合判定通过'
-  writeSignal('OK', orderInfo.value?.orderCode || '', productCode.value || '', orderInfo.value?.route_No || '')
-  addLog('success', '人工判定 OK，信号已输出')
+// 步骤三：全物料验证
+async function handleMaterialComplete(materials: { productCode: string, productCount: number }[]) {
+  if (!orderInfo.value) return
+  
+  addLog('info', '正在提交全物料验证...')
+  const t0 = Date.now()
+  const reqData = {
+    produceOrderCode: orderInfo.value.orderCode,
+    routeNo: orderInfo.value.route_No,
+    technicsProcessCode: config.technicsProcessCode,
+    tenantID: 'FD',
+    productMixCode: orderInfo.value.productMixCode || 'null',
+    productLine: orderInfo.value.productline_no || '',
+    materialList: materials
+  }
+  
+  const rec: ApiRecord = { title: '全物料验证', url: `${config.orderApiUrl}/../ProduceMessage/CompleteCheckInput`, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: reqData }
+  apiRecords.value.unshift(rec)
+  
+  try {
+    // 仿真拦截
+    if (productCode.value.toUpperCase().startsWith('MOCK-')) {
+      await new Promise(r => setTimeout(r, 600))
+      rec.status = 'success'
+      addLog('success', '[仿真] 全物料验证通过！准备开始定扭...')
+      startTighteningWorkflow()
+      return
+    }
+
+    const res = await completeCheckInput(config, reqData)
+    rec.duration = Date.now() - t0
+    rec.resBody = res
+    // 假设非抛错即为成功，或者检查 res.code
+    rec.status = 'success'
+    addLog('success', '全物料验证通过！准备开始定扭...')
+    testResult.value = 'OK'
+    resultMessage.value = '物料绑定全部成功，准备定扭'
+    startTighteningWorkflow()
+  } catch (err: any) {
+    rec.status = 'error'
+    testResult.value = 'NG'
+    resultMessage.value = '物料验证失败'
+    addLog('error', `物料验证失败: ${err.message}`)
+    alert(`全物料验证失败，请检查。\n错误信息: ${err.message}`)
+  }
 }
 
-function setNG() {
+// 开始自动定扭流程
+function startTighteningWorkflow() {
+  activeTab.value = 'torque'
+  if (torqueInteractionRef.value) {
+    torqueInteractionRef.value.executeNextPendingTask()
+  } else {
+    addLog('error', '定扭组件未加载')
+  }
+}
+
+// 定扭单步失败处理
+function handleTaskFailed(task: any) {
   testResult.value = 'NG'
-  resultMessage.value = '测试综合判定不通过'
-  writeSignal('NG', orderInfo.value?.orderCode || '', productCode.value || '', orderInfo.value?.route_No || '')
-  addLog('error', '人工判定 NG，信号已输出')
+  resultMessage.value = `螺丝拧紧失败: ${task.itemDisplayName}`
+  // 弹窗提示
+  alert(`螺丝拧紧失败！\n工步: ${task.workstepName}\n螺丝: ${task.itemDisplayName}\n判定: NG\n请确认后关闭此弹窗，系统将继续执行矩阵的下一个任务。`)
+  // 确认后继续
+  if (torqueInteractionRef.value) {
+    torqueInteractionRef.value.resumeTighteningWorkflow()
+  }
+}
+
+// 所有定扭完成
+function handleAllTasksComplete() {
+  testResult.value = 'OK'
+  resultMessage.value = '全部工步执行完毕，等待数据上传'
+  addLog('success', '🎉 当前产品所有定扭任务已完成！等待结果上传逻辑...')
+  // TODO: 上传结果
 }
 
 // 处理仿真产生的定扭结果
@@ -201,13 +265,30 @@ function handleMockTorque(data: { torque: string, angle: string, status: string 
     
     tighteningTasks.value = updatedTasks
     addLog('success', `[仿真结果] ${data.torque}Nm / ${data.angle}Deg [${data.status}] 已填入矩阵`)
+
+    // 触发自动化流程
+    if (task.result === 'FAIL') {
+      handleTaskFailed(task)
+    } else {
+      addLog('info', `[仿真流程] 拧紧成功，等待 2s 后继续...`)
+      setTimeout(() => {
+        if (torqueInteractionRef.value) {
+          torqueInteractionRef.value.executeNextPendingTask()
+        }
+      }, 2000)
+    }
   }
 }
 
 function resetResult() {
   testResult.value = 'IDLE'
   resultMessage.value = ''
-  clearSignal()
+  // 中止定扭流程中的等待循环（如果正在等待连接）
+  if (torqueInteractionRef.value) {
+    torqueInteractionRef.value.abortWorkflow()
+    // 稍后清除中止标志，以便下次流程可以正常启动
+    setTimeout(() => torqueInteractionRef.value?.resetWorkflow(), 100)
+  }
   addLog('info', '状态已复位，等待下一件')
 }
 </script>
@@ -309,12 +390,11 @@ function resetResult() {
           <div v-else class="empty-hint">等待扫码查询...</div>
         </div>
 
-        <!-- OK/NG 区域 -->
+        <!-- 状态及进度展示区域 -->
         <div class="card result-card">
           <div class="card-title">
             <span class="step-badge">3</span>
-            测试结果
-            <span class="lv-badge">→ LabVIEW信号</span>
+            总体流程状态
           </div>
 
           <div class="result-display" :class="testResult.toLowerCase()">
@@ -322,26 +402,9 @@ function resetResult() {
               {{ testResult === 'OK' ? '✅' : testResult === 'NG' ? '❌' : '⏳' }}
             </span>
             <span class="result-text">
-              {{ testResult === 'IDLE' ? '待检测' : testResult }}
+              {{ testResult === 'IDLE' ? '待执行' : testResult }}
             </span>
             <span v-if="resultMessage" class="result-msg">{{ resultMessage }}</span>
-          </div>
-
-          <div class="result-actions">
-            <button
-              class="btn-ok"
-              :disabled="!orderInfo || testResult !== 'IDLE'"
-              @click="setOK"
-            >
-              ✅ OK — 合格
-            </button>
-            <button
-              class="btn-ng"
-              :disabled="!orderInfo || testResult !== 'IDLE'"
-              @click="setNG"
-            >
-              ❌ NG — 不合格
-            </button>
           </div>
 
           <button
@@ -349,7 +412,7 @@ function resetResult() {
             class="btn-reset"
             @click="resetResult"
           >
-            🔄 复位 / 下一件
+            🔄 复位状态 / 准备下一件
           </button>
         </div>
 
@@ -421,7 +484,7 @@ function resetResult() {
             <MaterialScanner 
               :steps="routeSteps" 
               @log="addLog"
-              @complete="setOK"
+              @complete="handleMaterialComplete"
             />
 
             <!-- 定扭判定矩阵表格 (已按需移动至物料下方) -->
@@ -473,10 +536,13 @@ function resetResult() {
           <!-- 定扭交互 -->
           <div v-show="activeTab === 'torque'" class="tab-pane">
             <TorqueInteraction 
+              ref="torqueInteractionRef"
               :ip="config.desoutterIp"
               :port="config.desoutterPort"
               v-model:tasks="tighteningTasks"
               @log="addLog"
+              @taskFailed="handleTaskFailed"
+              @allTasksComplete="handleAllTasksComplete"
             />
           </div>
 

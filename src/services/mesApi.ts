@@ -5,7 +5,8 @@ import type {
   GetOrderRequest,
   GetOrderResponse,
   GetRouteRequest,
-  GetRouteResponse
+  GetRouteResponse,
+  CompleteCheckInputRequest
 } from '../types/mes'
 
 /**
@@ -57,4 +58,18 @@ export async function getRouteList(
     workSeqNo: config.technicsProcessCode
   }
   return postRequest<GetRouteResponse>(config.routeApiUrl, params)
+}
+
+/**
+ * 步骤三：全物料校验
+ * POST /api/ProduceMessage/CompleteCheckInput
+ */
+export async function completeCheckInput(
+  config: AppConfig,
+  data: CompleteCheckInputRequest
+): Promise<any> {
+  // Extract base URL from orderApiUrl, assuming orderApiUrl starts with the same proxy prefix
+  // Since vite.config.ts uses '/mes-api' proxy which points to the server, we just use the proxy prefix
+  const baseUrl = '/mes-api'
+  return postRequest<any>(`${baseUrl}/api/ProduceMessage/CompleteCheckInput`, data)
 }

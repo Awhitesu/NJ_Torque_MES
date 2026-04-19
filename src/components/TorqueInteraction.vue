@@ -12,6 +12,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'log', level: 'info'|'success'|'warn'|'error', msg: string): void
   (e: 'update:tasks', tasks: TighteningTask[]): void
+  (e: 'taskFailed', task: TighteningTask): void
+  (e: 'allTasksComplete'): void
 }>()
 
 // ==================== 状态管理 ====================
@@ -28,6 +30,9 @@ const isDataSubscribed = ref(false)
 
 const targetPSet = ref('001')
 let connection: any = null
+
+// 流程中止标志：只有用户点复位时才真正停止等待
+const workflowAborted = ref(false)
 
 onMounted(() => {
   initSignalR()
@@ -47,6 +52,7 @@ async function initSignalR() {
   connection.on('ReceiveLog', (entry: any) => {
     if (entry.level === 'success' && entry.msg.includes('[RX]')) {
        statusText.value = 'MID 0002 通信已建立 (已连接)'
+       isConnected.value = true  // 收到控制器回包也标记为已连接
     }
 
     if (entry.isHeartbeat) {
@@ -56,6 +62,17 @@ async function initSignalR() {
     } else {
       logLocal(entry.level, entry.msg)
     }
+  })
+
+  // 后端通知：SignalR 刚建立时，TCP 已连接 → 前端立即亮绿灯，并订阅拧紧数据
+  connection.on('ControllerConnected', async () => {
+    isConnected.value = true
+    statusText.value = 'TCP 已连接，等待工步下发...'
+    logLocal('success', '[System] ✅ 控制器 TCP 连接状态已同步')
+    // 订阅拧紧结果（只需发一次）
+    await sendCommandToBackend('0060')
+    isDataSubscribed.value = true
+    logLocal('info', '[System] 已订阅拧紧数据 (MID 0060)')
   })
 
   // 【核心交互】：处理拧紧结果并自动填入任务矩阵
@@ -73,17 +90,25 @@ async function initSignalR() {
       const task = updatedTasks[nextIdx]
       task.actualTorque = data.torque
       task.actualAngle = data.angle
-      task.timestamp = new Date().toLocaleTimeString()
+      // 完整日期时间格式
+      const now = new Date()
+      task.timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
       
       const tVal = parseFloat(data.torque)
       const aVal = parseFloat(data.angle)
       const tPass = (tVal >= task.torqueMin && tVal <= task.torqueMax)
       const aPass = (aVal >= task.angleMin && aVal <= task.angleMax)
       task.result = (tPass && aPass) ? 'PASS' : 'FAIL'
-    }
 
-    emit('update:tasks', updatedTasks)
-    logLocal('success', `结果入库：${data.torque}Nm / ${data.angle}Deg [${data.status}]`)
+      // 发射更新
+      emit('update:tasks', updatedTasks)
+      logLocal('success', `结果入库：${data.torque}Nm / ${data.angle}Deg [${data.status}]`)
+
+      // 触发后续自动化流程
+      handleTaskResult(task)
+    } else {
+      emit('update:tasks', updatedTasks)
+    }
   })
 
   try {
@@ -147,9 +172,14 @@ function logHeartbeat(level: 'info'|'success', msg: string) {
   if (heartbeatLogs.value.length > 20) heartbeatLogs.value.pop()
 }
 
-function handleConnect() {
+async function handleConnect() {
   logLocal('info', `[System] 请求后端建立 TCP 连接...`)
-  // C# 后端通常会自动维持连接，这里可以做重连触发
+  try {
+    await fetch('http://localhost:5246/api/reconnect', { method: 'POST' })
+    logLocal('info', '[System] 已通知后端发起 MID 0001 握手')
+  } catch (err) {
+    logLocal('error', '[System] 通知后端失败，请确认后端服务已启动')
+  }
 }
 
 function handleDisconnect() {
@@ -179,7 +209,85 @@ async function subscribeData() {
   isDataSubscribed.value = true
 }
 
-// receiveResult 逻辑现在由后端自动推送处理
+// =============== 自动化流程方法 ===============
+
+async function executeNextPendingTask() {
+  // 【等待连接】：TCP 未连接时轮询等待，而非中止流程
+  if (!isConnected.value) {
+    logLocal('warn', '[流程] ⏳ 控制器未连接，等待连接中...')
+    statusText.value = '⏳ 等待控制器连接中...'
+    // 每500ms检查一次，直到连上或流程被复位
+    await new Promise<void>((resolve) => {
+      const timer = setInterval(() => {
+        if (workflowAborted.value || isConnected.value) {
+          clearInterval(timer)
+          resolve()
+        }
+      }, 500)
+    })
+    if (workflowAborted.value) {
+      logLocal('info', '[流程] 流程已被复位，停止等待。')
+      return
+    }
+    logLocal('success', '[流程] ✅ 控制器已连接，继续执行！')
+  }
+
+  const nextIdx = props.tasks.findIndex(t => t.result === 'PENDING')
+  if (nextIdx === -1) {
+    logLocal('success', '所有定扭任务已完成')
+    emit('allTasksComplete')
+    return
+  }
+  
+  const task = props.tasks[nextIdx]
+  const psetVal = task.pSetNo.padStart(3, '0')
+  
+  logLocal('info', `[流程] 准备执行螺丝: ${task.itemDisplayName}, PSet: ${psetVal}`)
+  await sendCommandToBackend('0018', psetVal)
+  statusText.value = `已下发 PSet ${psetVal}`
+  
+  await new Promise(r => setTimeout(r, 200))
+  
+  await sendCommandToBackend('0043')
+  statusText.value = `工具已使能，等待拧紧结果... (PSet ${psetVal})`
+  // 注意：0060订阅已在连接成功时发送，此处无需重复发送
+}
+
+async function handleTaskResult(task: TighteningTask) {
+  // 1. 打完立刻断开使能 (0044)
+  await sendCommandToBackend('0044')
+  statusText.value = `已断开使能`
+  logLocal('info', `[流程] 收到结果，立刻下发 0044 断开使能`)
+  
+  if (task.result === 'FAIL') {
+    // 触发失败事件，让人工确认
+    logLocal('warn', `[流程] 拧紧失败，等待人工干预...`)
+    emit('taskFailed', task)
+  } else {
+    // 成功，等2秒，然后执行下一个
+    logLocal('info', `[流程] 拧紧成功，等待 2s 后继续...`)
+    await new Promise(r => setTimeout(r, 2000))
+    executeNextPendingTask()
+  }
+}
+
+// 暴露方法给外部调用（如 MaterialScanner 验证完毕后启动，或人工确认失败后继续）
+defineExpose({
+  executeNextPendingTask,
+  abortWorkflow: () => {
+    workflowAborted.value = true
+    logLocal('info', '[流程] 用户已复位，流程终止。')
+    statusText.value = '已复位，等待下一件'
+  },
+  resumeTighteningWorkflow: async () => {
+    logLocal('info', `[流程] 人工确认完毕，等待 2s 后继续...`)
+    await new Promise(r => setTimeout(r, 2000))
+    executeNextPendingTask()
+  },
+  resetWorkflow: () => {
+    workflowAborted.value = false
+  }
+})
 
 </script>
 

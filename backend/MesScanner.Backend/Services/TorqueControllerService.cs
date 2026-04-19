@@ -15,6 +15,7 @@ public class TorqueControllerService : BackgroundService
     private readonly string _ip = "192.168.5.212";
     private readonly int _port = 4545;
     private bool _isConnected = false;
+    public bool IsConnected => _isConnected;
     private DateTime _lastPacketTime = DateTime.MinValue;
 
     public TorqueControllerService(ILogger<TorqueControllerService> logger, IHubContext<TorqueHub> hubContext)
@@ -186,5 +187,20 @@ public class TorqueControllerService : BackgroundService
         await _hubContext.Clients.All.SendAsync("ReceiveLog", new LogEntry { 
             Level = level, Msg = msg, IsHeartbeat = isHeartbeat 
         });
+    }
+
+    /// <summary>
+    /// 前端手动触发重连：如果当前未连接，立即发起一次 TCP 握手
+    /// </summary>
+    public async Task TriggerReconnectAsync()
+    {
+        if (_isConnected)
+        {
+            Console.WriteLine("[Service] 已连接，无需重连");
+            await LogToFrontend("info", "[System] 当前已连接，无需重连");
+            return;
+        }
+        Console.WriteLine("[Service] 前端请求手动重连...");
+        await ConnectAndHandshakeAsync();
     }
 }
