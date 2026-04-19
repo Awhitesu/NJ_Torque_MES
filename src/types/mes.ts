@@ -131,6 +131,15 @@ export interface LabviewSignal {
   timestamp: string
   routeNo: string
 }
+
+/** 单次定扭尝试的原始数据记录 */
+export interface TighteningAttempt {
+  torque: string
+  angle: string
+  result: 'PASS' | 'FAIL'
+  timestamp: string
+}
+
 /** 单项定扭任务记录（细化到每一颗螺丝） */
 export interface TighteningTask {
   id: string              // 唯一标识，格式如：STEP-SCREW
@@ -151,7 +160,9 @@ export interface TighteningTask {
   actualAngle: string | null
 
   result: 'PENDING' | 'PASS' | 'FAIL' // 判定结果
-  timestamp?: string      // 采集时间
+  timestamp?: string      // 最后一次采集时间
+  retryCount: number      // 已重试次数
+  history: TighteningAttempt[] // 所有尝试的历史记录
 }
 
 export interface MaterialItem {

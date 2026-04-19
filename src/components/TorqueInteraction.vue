@@ -22,6 +22,7 @@ const currentPSet = ref<string>('-')
 const currentTorque = ref<string>('0.000')
 const currentAngle = ref<string>('0.0')
 const statusText = ref('等待连接控制器...')
+const workflowStatus = ref('等待流程开启...')
 
 const isHeartbeatActive = ref(false)
 const isPSetSet = ref(false)
@@ -84,25 +85,33 @@ async function initSignalR() {
     // 复制一份任务列表进行更新
     const updatedTasks = JSON.parse(JSON.stringify(props.tasks)) as TighteningTask[]
     
-    // 逻辑：寻找当前所有任务中，第一个还没有实测扭矩的任务
-    const nextIdx = updatedTasks.findIndex(t => !t.actualTorque)
+    // 逻辑：寻找当前所有任务中，第一个结果为 PENDING 的任务
+    const nextIdx = updatedTasks.findIndex(t => t.result === 'PENDING')
     if (nextIdx !== -1) {
       const task = updatedTasks[nextIdx]
+      const now = new Date()
+      const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
+      
+      // 直接根据控制器返回的 status 判定结果，不再根据上下限判定
+      const isPass = (data.status === 'OK')
+
+      // 保存到历史记录
+      task.history.push({
+        torque: data.torque,
+        angle: data.angle,
+        result: isPass ? 'PASS' : 'FAIL',
+        timestamp: timestamp
+      })
+
+      // 更新主字段
       task.actualTorque = data.torque
       task.actualAngle = data.angle
-      // 完整日期时间格式
-      const now = new Date()
-      task.timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
-      
-      const tVal = parseFloat(data.torque)
-      const aVal = parseFloat(data.angle)
-      const tPass = (tVal >= task.torqueMin && tVal <= task.torqueMax)
-      const aPass = (aVal >= task.angleMin && aVal <= task.angleMax)
-      task.result = (tPass && aPass) ? 'PASS' : 'FAIL'
+      task.timestamp = timestamp
+      task.result = isPass ? 'PASS' : 'FAIL'
 
       // 发射更新
       emit('update:tasks', updatedTasks)
-      logLocal('success', `结果入库：${data.torque}Nm / ${data.angle}Deg [${data.status}]`)
+      logLocal(isPass ? 'success' : 'error', `[数据] ${task.itemDisplayName}: ${data.torque}Nm / ${data.angle}Deg [${isPass ? 'PASS' : 'FAIL'}]`)
 
       // 触发后续自动化流程
       handleTaskResult(task)
@@ -234,12 +243,16 @@ async function executeNextPendingTask() {
 
   const nextIdx = props.tasks.findIndex(t => t.result === 'PENDING')
   if (nextIdx === -1) {
+    workflowStatus.value = '✅ 当前所有螺丝定扭任务已完成！'
     logLocal('success', '所有定扭任务已完成')
     emit('allTasksComplete')
     return
   }
   
   const task = props.tasks[nextIdx]
+  currentPSet.value = task.pSetNo
+  workflowStatus.value = `正在进行: ${task.itemDisplayName} (${task.workstepName})`
+  
   const psetVal = task.pSetNo.padStart(3, '0')
   
   logLocal('info', `[流程] 准备执行螺丝: ${task.itemDisplayName}, PSet: ${psetVal}`)
@@ -312,6 +325,14 @@ defineExpose({
       <div class="actions">
         <button v-if="!isConnected" class="btn connect" @click="handleConnect">🔗 连接接口 (MID 0001)</button>
         <button v-else class="btn disconnect" @click="handleDisconnect">🔌 断开连接 (MID 0003)</button>
+      </div>
+    </div>
+    
+    <!-- 自动化流程状态栏 -->
+    <div class="workflow-bar" v-if="isConnected">
+      <div class="wf-content">
+        <span class="wf-icon">🚀</span>
+        <span class="wf-text">{{ workflowStatus }}</span>
       </div>
     </div>
 
@@ -565,6 +586,37 @@ defineExpose({
   color: #00e676;
   text-shadow: 0 0 16px rgba(0, 230, 118, 0.2);
 }
+
+.workflow-bar {
+  margin-bottom: 20px;
+  background: rgba(100, 181, 246, 0.08);
+  border: 1px solid rgba(100, 181, 246, 0.2);
+  border-radius: 8px;
+  padding: 12px 16px;
+  border-left: 4px solid #64b5f6;
+}
+.wf-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.wf-icon {
+  font-size: 18px;
+  animation: bounce 2s infinite;
+}
+.wf-text {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e3f2fd;
+  letter-spacing: 0.5px;
+}
+
+@keyframes bounce {
+  0%, 20%, 50%, 80%, 100% {transform: translateY(0);}
+  40% {transform: translateY(-5px);}
+  60% {transform: translateY(-3px);}
+}
+
 
 .controls-panel {
   margin-top: auto;

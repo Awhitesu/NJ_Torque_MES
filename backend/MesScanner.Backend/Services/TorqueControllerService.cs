@@ -158,9 +158,21 @@ public class TorqueControllerService : BackgroundService
                 string angleStr = raw.Length >= 175 ? raw.Substring(170, 5) : "00000";
                 double angleVal = double.Parse(angleStr) / 10.0;
 
-                // 拧紧状态: Offset 105 (1:OK, 0:NOK)
-                string statusChar = raw.Length >= 106 ? raw.Substring(105, 1) : "0";
-                string statusText = (statusChar == "1") ? "OK" : "NOK";
+                // 拧紧状态解析 (标准 Open Protocol)
+                // Offset 105: Tightening status (0:NOK, 1:OK)
+                // Offset 107: Torque status (0:Low, 1:OK, 2:High)
+                string tightStatus = raw.Length >= 106 ? raw.Substring(105, 1) : "0";
+                string torqueStatus = raw.Length >= 108 ? raw.Substring(107, 1) : "0";
+                
+                // 只要任意一个是 '1'，我们就认为是 OK (兼容性更强)
+                bool isOk = (tightStatus == "1" || torqueStatus == "1");
+                string statusText = isOk ? "OK" : "NOK";
+
+                // 打印调试信息，方便看清报文第 100-120 位的内容
+                if (raw.Length >= 120) {
+                    string debugArea = raw.Substring(100, 20);
+                    Console.WriteLine($"[Service] 状态位调试 (100-120位): [{debugArea}] -> 解析结果: {statusText}");
+                }
 
                 await _hubContext.Clients.All.SendAsync("ReceiveData", new TorqueResult {
                     Torque = torqueVal.ToString("F3"), 
@@ -168,7 +180,7 @@ public class TorqueControllerService : BackgroundService
                     Status = statusText
                 });
 
-                Console.WriteLine($"[Service] 实战数据已就绪: {torqueVal:F3}Nm / {angleVal:F1}Deg - {statusText}");
+                Console.WriteLine($"[Service] 实战数据已就绪: {torqueVal:F3}Nm / {angleVal:F1}Deg - {statusText} (T:{tightStatus}, Q:{torqueStatus})");
             }
             catch (Exception ex)
             {

@@ -154,7 +154,9 @@ function generateTasks(steps: RouteStep[]) {
           itemDisplayName: `螺丝${i}`,
           torqueMin: 0, torqueMax: 0, torqueUnit: '', actualTorque: null,
           angleMin: 0, angleMax: 0, angleUnit: '', actualAngle: null,
-          result: 'PENDING'
+          result: 'PENDING',
+          retryCount: 0,
+          history: []
         };
         (step.workStepParamList || []).forEach(p => {
           if (p.paramName && p.paramName.includes('扭矩')) {
@@ -232,14 +234,47 @@ function startTighteningWorkflow() {
 }
 
 // 定扭单步失败处理
-function handleTaskFailed(task: any) {
+function handleTaskFailed(failedTask: TighteningTask) {
+  const MAX_RETRIES = 3
+  
+  // 找到真正的响应式任务对象
+  const task = tighteningTasks.value.find(t => t.id === failedTask.id)
+  if (!task) return
+
+  task.retryCount = (task.retryCount || 0) + 1
+  
   testResult.value = 'NG'
-  resultMessage.value = `螺丝拧紧失败: ${task.itemDisplayName}`
-  // 弹窗提示
-  alert(`螺丝拧紧失败！\n工步: ${task.workstepName}\n螺丝: ${task.itemDisplayName}\n判定: NG\n请确认后关闭此弹窗，系统将继续执行矩阵的下一个任务。`)
-  // 确认后继续
-  if (torqueInteractionRef.value) {
-    torqueInteractionRef.value.resumeTighteningWorkflow()
+  resultMessage.value = `螺丝拧紧失败: ${task.itemDisplayName} (第 ${task.retryCount} 次尝试)`
+  addLog('error', `[流程] ${task.itemDisplayName} 拧紧失败，当前尝试次数: ${task.retryCount}`)
+
+  if (task.retryCount < MAX_RETRIES) {
+    const wantRetry = confirm(`螺丝拧紧失败！\n螺丝: ${task.itemDisplayName}\n当前重试次数: ${task.retryCount} / ${MAX_RETRIES}\n\n点击“确定”：重新执行当前螺丝定扭\n点击“取消”：跳过当前螺丝（标记为失败）并继续下一个`)
+    
+    if (wantRetry) {
+      task.result = 'PENDING'
+      task.actualTorque = null
+      task.actualAngle = null
+      
+      // 清除大标题的 NG 状态
+      testResult.value = 'IDLE'
+      resultMessage.value = `正在重试: ${task.itemDisplayName}...`
+      
+      addLog('info', `[流程] 用户选择重试螺丝: ${task.itemDisplayName}`)
+      if (torqueInteractionRef.value) {
+        torqueInteractionRef.value.executeNextPendingTask()
+      }
+    } else {
+      addLog('warn', `[流程] 用户选择跳过失败螺丝: ${task.itemDisplayName}`)
+      if (torqueInteractionRef.value) {
+        torqueInteractionRef.value.resumeTighteningWorkflow()
+      }
+    }
+  } else {
+    alert(`定扭失败次数已达上限 (${MAX_RETRIES}次)！\n螺丝: ${task.itemDisplayName}\n流程将停止，请手动复位。`)
+    addLog('error', `[流程] ${task.itemDisplayName} 达到重试上限，流程停止。`)
+    if (torqueInteractionRef.value) {
+      torqueInteractionRef.value.abortWorkflow()
+    }
   }
 }
 
@@ -253,29 +288,40 @@ function handleAllTasksComplete() {
 
 // 处理仿真产生的定扭结果
 function handleMockTorque(data: { torque: string, angle: string, status: string }) {
-  // 查找任务矩阵中第一个待完成项
   const updatedTasks = JSON.parse(JSON.stringify(tighteningTasks.value)) as TighteningTask[]
-  const nextIdx = updatedTasks.findIndex(t => !t.actualTorque)
+  const nextIdx = updatedTasks.findIndex(t => t.result === 'PENDING')
   
   if (nextIdx !== -1) {
     const task = updatedTasks[nextIdx]
+    const now = new Date()
+    const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
+    const isPass = data.status === 'OK'
+
+    // 保存到历史
+    task.history.push({
+      torque: data.torque,
+      angle: data.angle,
+      result: isPass ? 'PASS' : 'FAIL',
+      timestamp: timestamp
+    })
+
     task.actualTorque = data.torque
     task.actualAngle = data.angle
-    task.result = data.status === 'OK' ? 'PASS' : 'FAIL'
+    task.timestamp = timestamp
+    task.result = isPass ? 'PASS' : 'FAIL'
     
     tighteningTasks.value = updatedTasks
-    addLog('success', `[仿真结果] ${data.torque}Nm / ${data.angle}Deg [${data.status}] 已填入矩阵`)
+    addLog('success', `[仿真结果] ${task.itemDisplayName}: ${data.torque}Nm / ${data.angle}Deg [${data.status}]`)
 
-    // 触发自动化流程
     if (task.result === 'FAIL') {
       handleTaskFailed(task)
     } else {
-      addLog('info', `[仿真流程] 拧紧成功，等待 2s 后继续...`)
+      addLog('info', `[仿真流程] 拧紧成功，即将执行下一个...`)
       setTimeout(() => {
         if (torqueInteractionRef.value) {
           torqueInteractionRef.value.executeNextPendingTask()
         }
-      }, 2000)
+      }, 500)
     }
   }
 }
@@ -506,6 +552,7 @@ function resetResult() {
                       <th>目标角度</th>
                       <th>实测角度</th>
                       <th>结果</th>
+                      <th>次数/历史</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -522,6 +569,15 @@ function resetResult() {
                         <span v-if="task.result === 'PASS'" class="badge pass">OK</span>
                         <span v-else-if="task.result === 'FAIL'" class="badge fail">NG</span>
                         <span v-else class="badge pending">等待</span>
+                      </td>
+                      <td>
+                        <div class="retry-col">
+                          <span v-if="task.retryCount > 0" class="retry-count">x{{ task.retryCount }}</span>
+                          <span v-else class="retry-zero">--</span>
+                          <div v-if="task.history && task.history.length > 1" class="history-preview" :title="task.history.map(h => `${h.timestamp}: ${h.torque}Nm / ${h.angle}Deg [${h.result}]`).join('\n')">
+                            📜 历史
+                          </div>
+                        </div>
                       </td>
                     </tr>
                     <tr v-if="!tighteningTasks.length">
@@ -1246,6 +1302,29 @@ kbd {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+.retry-col {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+}
+.retry-count {
+  background: rgba(255, 171, 64, 0.1);
+  color: #ffab40;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: bold;
+}
+.retry-zero { color: #546e7a; font-size: 10px; }
+.history-preview {
+  font-size: 12px;
+  cursor: help;
+  opacity: 0.8;
+}
+.history-preview:hover { opacity: 1; }
+
 
 /* 定扭判定矩阵 (对齐物料验证 UI) */
 .tightening-matrix-card-modern {
