@@ -67,24 +67,19 @@ async function initSignalR() {
     // 复制一份任务列表进行更新
     const updatedTasks = JSON.parse(JSON.stringify(props.tasks)) as TighteningTask[]
     
-    // 逻辑：寻找当前所有任务中，第一个还没有实测值的“扭矩”项
-    const nextTorqueIdx = updatedTasks.findIndex(t => t.paramName.includes('扭矩') && !t.actualValue)
-    if (nextTorqueIdx !== -1) {
-      const task = updatedTasks[nextTorqueIdx]
-      task.actualValue = data.torque
-      const val = parseFloat(data.torque)
-      task.result = (val >= task.min && val <= task.max) ? 'PASS' : 'FAIL'
+    // 逻辑：寻找当前所有任务中，第一个还没有实测扭矩的任务
+    const nextIdx = updatedTasks.findIndex(t => !t.actualTorque)
+    if (nextIdx !== -1) {
+      const task = updatedTasks[nextIdx]
+      task.actualTorque = data.torque
+      task.actualAngle = data.angle
       task.timestamp = new Date().toLocaleTimeString()
       
-      // 联动找到紧随其后的“角度”项（通常配对出现）
-      const nextAngleIdx = updatedTasks.findIndex((t, idx) => idx > nextTorqueIdx && t.paramName.includes('角度') && !t.actualValue)
-      if (nextAngleIdx !== -1) {
-        const aTask = updatedTasks[nextAngleIdx]
-        aTask.actualValue = data.angle
-        const aVal = parseFloat(data.angle)
-        aTask.result = (aVal >= aTask.min && aVal <= aTask.max) ? 'PASS' : 'FAIL'
-        aTask.timestamp = new Date().toLocaleTimeString()
-      }
+      const tVal = parseFloat(data.torque)
+      const aVal = parseFloat(data.angle)
+      const tPass = (tVal >= task.torqueMin && tVal <= task.torqueMax)
+      const aPass = (aVal >= task.angleMin && aVal <= task.angleMax)
+      task.result = (tPass && aPass) ? 'PASS' : 'FAIL'
     }
 
     emit('update:tasks', updatedTasks)

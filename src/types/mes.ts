@@ -131,19 +131,25 @@ export interface LabviewSignal {
   timestamp: string
   routeNo: string
 }
-/** 单项定扭任务记录（细化到每一颗螺丝的每一个参数） */
+/** 单项定扭任务记录（细化到每一颗螺丝） */
 export interface TighteningTask {
-  id: string              // 唯一标识，格式如：STEP-SCREW-PARAM
+  id: string              // 唯一标识，格式如：STEP-SCREW
   workstepNo: string      // 所属工步编号
   workstepName: string    // 所属工步名称，如 "M6定扭"
   pSetNo: string          // 程序号/PSet编号
   screwIndex: number      // 螺丝序号，1-N
-  itemDisplayName: string // 显示名称，如 "螺丝1定扭扭矩"
-  paramName: string       // 参数内部名，如 "定扭扭矩"
-  min: number             // 判定下限
-  max: number             // 判定上限
-  unit: string            // 单位
-  actualValue: string | null // 实测值
+  itemDisplayName: string // 显示名称，如 "螺丝1"
+  
+  torqueMin: number
+  torqueMax: number
+  torqueUnit: string
+  actualTorque: string | null
+
+  angleMin: number
+  angleMax: number
+  angleUnit: string
+  actualAngle: string | null
+
   result: 'PENDING' | 'PASS' | 'FAIL' // 判定结果
   timestamp?: string      // 采集时间
 }

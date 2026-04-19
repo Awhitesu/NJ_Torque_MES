@@ -11,7 +11,7 @@ export default defineConfig({
     proxy: {
       // 将 /mes-api/* 代理到 MES 服务器，解决浏览器 CORS 问题
       '/mes-api': {
-        target: 'http://127.0.0.1:8076',
+        target: 'http://172.25.57.144:8076',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/mes-api/, ''),
         configure: (proxy) => {

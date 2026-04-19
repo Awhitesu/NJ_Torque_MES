@@ -31,14 +31,14 @@ function simulateMaterialScan() {
 
 function simulateTorque() {
   // 寻找下一个需要拧紧的任务
-  const nextIdx = props.tasks.findIndex(t => t.paramName.includes('扭矩') && !t.actualValue)
+  const nextIdx = props.tasks.findIndex(t => !t.actualTorque)
   if (nextIdx === -1) {
     emit('log', 'warn', '[模拟] 当前无待完成的拧紧任务')
     return
   }
 
   const task = props.tasks[nextIdx]
-  const result = MockHardware.simulateTorqueResult(1.5, task.min, task.max)
+  const result = MockHardware.simulateTorqueResult(1.5, task.torqueMin, task.torqueMax)
   
   emit('log', 'info', `[模拟] 产生定扭结果: ${result.torque}Nm, ${result.angle}Deg [${result.status}]`)
   emit('mockTorque', result)

@@ -144,21 +144,29 @@ function generateTasks(steps: RouteStep[]) {
     
     if (count > 0) {
       for (let i = 1; i <= count; i++) {
+        const task: TighteningTask = {
+          id: `${step.workstepNo}-${i}`,
+          workstepNo: step.workstepNo || '',
+          workstepName: step.workstepName || '',
+          pSetNo: pSetNo,
+          screwIndex: i,
+          itemDisplayName: `螺丝${i}`,
+          torqueMin: 0, torqueMax: 0, torqueUnit: '', actualTorque: null,
+          angleMin: 0, angleMax: 0, angleUnit: '', actualAngle: null,
+          result: 'PENDING'
+        };
         (step.workStepParamList || []).forEach(p => {
-          newTasks.push({
-            id: `${step.workstepNo}-${i}-${p.paramName}`,
-            workstepNo: step.workstepNo || '',
-            workstepName: step.workstepName || '',
-            pSetNo: pSetNo,
-            screwIndex: i,
-            itemDisplayName: `螺丝${i} - ${p.paramName}`,
-            paramName: p.paramName || '',
-            min: Number(p.minQualityValue) || 0,
-            max: Number(p.maxQualityValue) || 0,
-            unit: p.paramUnit || '',
-            actualValue: null, result: 'PENDING'
-          })
-        })
+          if (p.paramName && p.paramName.includes('扭矩')) {
+            task.torqueMin = Number(p.minQualityValue) || 0;
+            task.torqueMax = Number(p.maxQualityValue) || 0;
+            task.torqueUnit = p.paramUnit || '';
+          } else if (p.paramName && p.paramName.includes('角度')) {
+            task.angleMin = Number(p.minQualityValue) || 0;
+            task.angleMax = Number(p.maxQualityValue) || 0;
+            task.angleUnit = p.paramUnit || '';
+          }
+        });
+        newTasks.push(task);
       }
     }
   })
@@ -183,20 +191,13 @@ function setNG() {
 function handleMockTorque(data: { torque: string, angle: string, status: string }) {
   // 查找任务矩阵中第一个待完成项
   const updatedTasks = JSON.parse(JSON.stringify(tighteningTasks.value)) as TighteningTask[]
-  const nextTorqueIdx = updatedTasks.findIndex(t => t.paramName.includes('扭矩') && !t.actualValue)
+  const nextIdx = updatedTasks.findIndex(t => !t.actualTorque)
   
-  if (nextTorqueIdx !== -1) {
-    const task = updatedTasks[nextTorqueIdx]
-    task.actualValue = data.torque
+  if (nextIdx !== -1) {
+    const task = updatedTasks[nextIdx]
+    task.actualTorque = data.torque
+    task.actualAngle = data.angle
     task.result = data.status === 'OK' ? 'PASS' : 'FAIL'
-    
-    // 配对角度
-    const nextAngleIdx = updatedTasks.findIndex((t, idx) => idx > nextTorqueIdx && t.paramName.includes('角度') && !t.actualValue)
-    if (nextAngleIdx !== -1) {
-      const aTask = updatedTasks[nextAngleIdx]
-      aTask.actualValue = data.angle
-      aTask.result = data.status === 'OK' ? 'PASS' : 'FAIL'
-    }
     
     tighteningTasks.value = updatedTasks
     addLog('success', `[仿真结果] ${data.torque}Nm / ${data.angle}Deg [${data.status}] 已填入矩阵`)
@@ -427,7 +428,7 @@ function resetResult() {
             <div class="tightening-matrix-card-modern">
               <div class="matrix-header-modern">
                 <span class="matrix-title">🔥 定扭判定矩阵 (基于工单工步自动展解)</span>
-                <button class="btn-text-modern" @click="tighteningTasks.forEach(t => t.actualValue = null)">重置进度</button>
+                <button class="btn-text-modern" @click="tighteningTasks.forEach(t => { t.actualTorque = null; t.actualAngle = null; t.result = 'PENDING'; })">重置进度</button>
               </div>
               <div class="matrix-table-wrap">
                 <table class="matrix-table-modern">
@@ -437,10 +438,10 @@ function resetResult() {
                       <th>工步名称</th>
                       <th>程序号</th>
                       <th>项目名称</th>
-                      <th>最小</th>
-                      <th>最大</th>
-                      <th>单位</th>
-                      <th>测试值</th>
+                      <th>目标扭矩</th>
+                      <th>实测扭矩</th>
+                      <th>目标角度</th>
+                      <th>实测角度</th>
                       <th>结果</th>
                     </tr>
                   </thead>
@@ -450,10 +451,10 @@ function resetResult() {
                       <td>{{ task.workstepName }}</td>
                       <td><span class="badge pset">{{ task.pSetNo }}</span></td>
                       <td>{{ task.itemDisplayName }}</td>
-                      <td>{{ task.min }}</td>
-                      <td>{{ task.max }}</td>
-                      <td>{{ task.unit }}</td>
-                      <td class="mono b">{{ task.actualValue || '--' }}</td>
+                      <td style="color:#78909c; font-size: 11px;">{{ task.torqueMin }} - {{ task.torqueMax }} {{ task.torqueUnit }}</td>
+                      <td class="mono b" :style="{ color: task.actualTorque ? '#00e676' : 'inherit' }">{{ task.actualTorque || '--' }}</td>
+                      <td style="color:#78909c; font-size: 11px;">{{ task.angleMin }} - {{ task.angleMax }} {{ task.angleUnit }}</td>
+                      <td class="mono b" :style="{ color: task.actualAngle ? '#00e676' : 'inherit' }">{{ task.actualAngle || '--' }}</td>
                       <td>
                         <span v-if="task.result === 'PASS'" class="badge pass">OK</span>
                         <span v-else-if="task.result === 'FAIL'" class="badge fail">NG</span>
@@ -461,7 +462,7 @@ function resetResult() {
                       </td>
                     </tr>
                     <tr v-if="!tighteningTasks.length">
-                      <td colspan="8" class="empty-text">暂无定扭配置，请先查询工单工步</td>
+                      <td colspan="9" class="empty-text">暂无定扭配置，请先查询工单工步</td>
                     </tr>
                   </tbody>
                 </table>
