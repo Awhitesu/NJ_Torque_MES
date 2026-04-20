@@ -68,13 +68,15 @@ public class TorqueControllerService : BackgroundService
             if (_tcpClient.Connected)
             {
                 _stream = _tcpClient.GetStream();
-                _isConnected = true;
+                _isConnected = true; // 只要 TCP 通了就认为已连接，方便前端操作
                 Console.WriteLine($"[Service] {DateTime.Now:HH:mm:ss} ✔ 物理成功连上控制器！");
                 await LogToFrontend("success", "[System] TCP 链路已连通");
+                await _hubContext.Clients.All.SendAsync("ReceiveStatus", "已连接");
 
-                await Task.Delay(1000); 
-                await SendPacketAsync("00200001            "); 
+                await Task.Delay(500); 
+                await SendPacketAsync("00200001001         "); 
                 
+                // 开启读取循环
                 _ = Task.Run(() => ReadLoopAsync());
             }
         }
@@ -89,15 +91,16 @@ public class TorqueControllerService : BackgroundService
     {
         try 
         {
-            if (!_isConnected || _stream == null) return;
+            if (_stream == null) return;
             
             byte[] asciiData = Encoding.ASCII.GetBytes(asciiStr);
-            // 动态长度：ASCII 长度 + 1 字节 NULL 终止符
-            byte[] fullPacket = new byte[asciiData.Length + 1]; 
+            byte[] fullPacket = new byte[asciiData.Length + 1];
             Array.Copy(asciiData, 0, fullPacket, 0, asciiData.Length);
-            fullPacket[fullPacket.Length - 1] = 0x00; 
+            fullPacket[fullPacket.Length - 1] = 0x00; // 核心：马头控制器通常需要 NULL 终止符
 
             await _stream.WriteAsync(fullPacket, 0, fullPacket.Length);
+
+
             _lastPacketTime = DateTime.Now;
 
             bool isHeartbeat = asciiStr.Contains("9999");
@@ -136,6 +139,8 @@ public class TorqueControllerService : BackgroundService
         finally { _isConnected = false; }
     }
 
+
+
     private async Task ProcessResponse(string raw)
     {
         string mid = "";
@@ -145,6 +150,33 @@ public class TorqueControllerService : BackgroundService
         if (!isHeartbeat) Console.WriteLine($"[Service] {DateTime.Now:HH:mm:ss} RX <<< {raw}");
         
         await LogToFrontend("success", $"[RX] {raw}", isHeartbeat);
+
+        // 处理错误回包 (MID 0004): 20-byte header + failed MID(4) + error code(2)
+        if (mid == "0004")
+        {
+            string failedMid = raw.Length >= 24 ? raw.Substring(20, 4).Trim() : "未知";
+            string errorCode = raw.Length >= 26 ? raw.Substring(24, 2).Trim() : "未知";
+
+            if (failedMid == "0060" && errorCode == "09")
+            {
+                Console.WriteLine($"[Service] ⚠️ 数据订阅 0060 被控制器拒绝，错误代码: {errorCode}，通常表示已订阅，继续等待 0061 数据");
+                await LogToFrontend("warn", $"[System] 数据订阅已存在或被控制器忽略 (MID 0060, 错误码:{errorCode})，继续等待上报数据");
+            }
+            else
+            {
+                Console.WriteLine($"[Service] ❌ 指令 {failedMid} 被拒绝，错误代码: {errorCode}，原始报文: {raw}");
+                await LogToFrontend("error", $"[System] 指令 {failedMid} 被拒绝 (错误码:{errorCode})");
+            }
+        }
+
+        // 处理握手成功 (MID 0002)
+        if (mid == "0002")
+        {
+            _isConnected = true; // 握手成功才算真正连接
+            Console.WriteLine($"[Service] 🤝 MID 0001 握手成功！系统就绪。");
+            await LogToFrontend("success", "[System] 控制器握手成功 (MID 0002)");
+            await _hubContext.Clients.All.SendAsync("ReceiveStatus", "已连接");
+        }
 
         if (mid == "0061")
         {

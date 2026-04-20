@@ -17,7 +17,8 @@ const emit = defineEmits<{
 }>()
 
 // ==================== 状态管理 ====================
-const isConnected = ref(false)
+const isSignalRConnected = ref(false)
+const isConnected = ref(false) // 对应控制器连接状态
 const currentPSet = ref<string>('-')
 const currentTorque = ref<string>('0.000')
 const currentAngle = ref<string>('0.0')
@@ -31,6 +32,8 @@ const isDataSubscribed = ref(false)
 
 const targetPSet = ref('001')
 let connection: any = null
+const isPreparingTask = ref(false)
+const armedTaskId = ref<string | null>(null)
 
 // 流程中止标志：只有用户点复位时才真正停止等待
 const workflowAborted = ref(false)
@@ -45,16 +48,20 @@ onUnmounted(() => {
 
 async function initSignalR() {
   connection = new HubConnectionBuilder()
-    .withUrl('http://localhost:5246/torqueHub') 
+    .withUrl('/api/torqueHub') 
     .withAutomaticReconnect()
     .configureLogging(LogLevel.Information)
     .build()
 
   connection.on('ReceiveLog', (entry: any) => {
-    if (entry.level === 'success' && entry.msg.includes('[RX]')) {
-       statusText.value = 'MID 0002 通信已建立 (已连接)'
-       isConnected.value = true  // 收到控制器回包也标记为已连接
+    if (entry.level === 'success' && (entry.msg.includes('[RX]') || entry.msg.includes('TCP 链路已连通'))) {
+       statusText.value = '通信已建立 (已连接)'
+       isConnected.value = true
+       if (props.tasks.some(t => t.result === 'PENDING')) {
+         void executeNextPendingTask()
+       }
     }
+
 
     if (entry.isHeartbeat) {
       logHeartbeat(entry.level, entry.msg)
@@ -70,14 +77,28 @@ async function initSignalR() {
     isConnected.value = true
     statusText.value = 'TCP 已连接，等待工步下发...'
     logLocal('success', '[System] ✅ 控制器 TCP 连接状态已同步')
-    // 订阅拧紧结果（只需发一次）
-    await sendCommandToBackend('0060')
-    isDataSubscribed.value = true
-    logLocal('info', '[System] 已订阅拧紧数据 (MID 0060)')
+    void executeNextPendingTask()
   })
 
   // 【核心交互】：处理拧紧结果并自动填入任务矩阵
+  connection.on('ReceiveStatus', (status: string) => {
+    if (status.includes('物理成功连上控制器') || status.includes('已连接')) {
+      isConnected.value = true
+      if (props.tasks.some(t => t.result === 'PENDING')) {
+        void executeNextPendingTask()
+      }
+    } else if (status.includes('连接断开') || status.includes('未连接')) {
+      isConnected.value = false
+      isPSetSet.value = false
+      isToolEnabled.value = false
+      isDataSubscribed.value = false
+      armedTaskId.value = null
+    }
+    logLocal('info', `[System] ${status}`)
+  })
+
   connection.on('ReceiveData', (data: any) => {
+    armedTaskId.value = null
     currentTorque.value = data.torque
     currentAngle.value = data.angle
     statusText.value = `收到拧紧结果: ${data.status}`
@@ -122,9 +143,11 @@ async function initSignalR() {
 
   try {
     await connection.start()
-    isConnected.value = true 
+    isSignalRConnected.value = true 
     logLocal('success', '[System] 已连接到 C# 实时通讯服务')
-  } catch (err) {
+    
+    // 启动后尝试查询一次后端状态（可选，但目前我们依赖后端推送）
+  } catch (err: any) {
     isConnected.value = false
     logLocal('error', '[System] 无法连接到 C# 服务')
   }
@@ -132,10 +155,11 @@ async function initSignalR() {
 
 async function sendCommandToBackend(mid: string, pset: string = "") {
   try {
-    await fetch(`http://localhost:5246/api/command?mid=${mid}&pset=${pset}`, { 
+    await fetch(`http://127.0.0.1:5246/command?mid=${mid}&pset=${pset}`, { 
       method: 'POST' 
     })
   } catch (err) {
+
     logLocal('error', '[System] 指令下发失败，请求后端 API 异常')
   }
 }
@@ -184,9 +208,13 @@ function logHeartbeat(level: 'info'|'success', msg: string) {
 async function handleConnect() {
   logLocal('info', `[System] 请求后端建立 TCP 连接...`)
   try {
-    await fetch('http://localhost:5246/api/reconnect', { method: 'POST' })
+    await fetch('http://127.0.0.1:5246/reconnect', { method: 'POST' })
     logLocal('info', '[System] 已通知后端发起 MID 0001 握手')
+    if (props.tasks.some(t => t.result === 'PENDING')) {
+      void executeNextPendingTask()
+    }
   } catch (err) {
+
     logLocal('error', '[System] 通知后端失败，请确认后端服务已启动')
   }
 }
@@ -205,22 +233,21 @@ async function sendPSet() {
 async function enableTool() {
   await sendCommandToBackend('0043')
   statusText.value = `正在解锁工具...`
+  isToolEnabled.value = true
 }
 
 async function lockTool() {
   await sendCommandToBackend('0042')
   statusText.value = `正在强制锁定工具...`
+  isToolEnabled.value = false
 }
 
-async function subscribeData() {
-  await sendCommandToBackend('0060')
-  statusText.value = `正在订阅拧紧结果数据...`
-  isDataSubscribed.value = true
-}
 
 // =============== 自动化流程方法 ===============
 
 async function executeNextPendingTask() {
+  if (isPreparingTask.value) return
+
   // 【等待连接】：TCP 未连接时轮询等待，而非中止流程
   if (!isConnected.value) {
     logLocal('warn', '[流程] ⏳ 控制器未连接，等待连接中...')
@@ -250,39 +277,62 @@ async function executeNextPendingTask() {
   }
   
   const task = props.tasks[nextIdx]
+  if (armedTaskId.value === task.id) {
+    statusText.value = `就绪，等待拧紧结果... (PSet ${currentPSet.value})`
+    workflowStatus.value = `正在等待控制器上报: ${task.itemDisplayName} (${task.workstepName})`
+    return
+  }
+
   currentPSet.value = task.pSetNo
   workflowStatus.value = `正在进行: ${task.itemDisplayName} (${task.workstepName})`
   
   const psetVal = task.pSetNo.padStart(3, '0')
   
-  logLocal('info', `[流程] 准备执行螺丝: ${task.itemDisplayName}, PSet: ${psetVal}`)
-  await sendCommandToBackend('0018', psetVal)
-  statusText.value = `已下发 PSet ${psetVal}`
-  
-  await new Promise(r => setTimeout(r, 200))
-  
-  await sendCommandToBackend('0043')
-  statusText.value = `工具已使能，等待拧紧结果... (PSet ${psetVal})`
-  // 注意：0060订阅已在连接成功时发送，此处无需重复发送
+  isPreparingTask.value = true
+  try {
+    logLocal('info', `[流程] 准备执行螺丝: ${task.itemDisplayName}, PSet: ${psetVal}`)
+    targetPSet.value = psetVal
+    await sendCommandToBackend('0018', psetVal)
+    isPSetSet.value = true
+    statusText.value = `已下发 PSet ${psetVal}`
+    
+    await new Promise(r => setTimeout(r, 200))
+    
+    await sendCommandToBackend('0043')
+    isToolEnabled.value = true
+    statusText.value = `工具已使能，正在订阅数据...`
+    
+    if (!isDataSubscribed.value) {
+      await sendCommandToBackend('0060')
+      isDataSubscribed.value = true
+    }
+    armedTaskId.value = task.id
+    workflowStatus.value = `正在等待控制器上报: ${task.itemDisplayName} (${task.workstepName})`
+    statusText.value = `就绪，等待拧紧结果... (PSet ${psetVal})`
+  } finally {
+    isPreparingTask.value = false
+  }
 }
 
 async function handleTaskResult(task: TighteningTask) {
-  // 1. 打完立刻断开使能 (0044)
-  await sendCommandToBackend('0044')
-  statusText.value = `已断开使能`
-  logLocal('info', `[流程] 收到结果，立刻下发 0044 断开使能`)
+  // 1. 打完立刻下发 0042 锁定工具 (Disable Tool)，防止误连打
+  await sendCommandToBackend('0042')
+  isToolEnabled.value = false
+  statusText.value = `工具已锁定`
+  logLocal('info', `[流程] 收到结果，立刻下发 0042 锁定工具`)
   
   if (task.result === 'FAIL') {
-    // 触发失败事件，让人工确认
-    logLocal('warn', `[流程] 拧紧失败，等待人工干预...`)
+    // 2. 失败情况：保持锁定，等待人工确认
+    logLocal('warn', `[流程] 拧紧失败，工具保持锁定，等待人工干预...`)
     emit('taskFailed', task)
   } else {
-    // 成功，等2秒，然后执行下一个
+    // 3. 成功情况：等待 2s 后切换下一颗并解锁
     logLocal('info', `[流程] 拧紧成功，等待 2s 后继续...`)
     await new Promise(r => setTimeout(r, 2000))
     executeNextPendingTask()
   }
 }
+
 
 // 暴露方法给外部调用（如 MaterialScanner 验证完毕后启动，或人工确认失败后继续）
 defineExpose({
@@ -293,6 +343,11 @@ defineExpose({
     statusText.value = '已复位，等待下一件'
     workflowStatus.value = '等待流程开启...'
     currentPSet.value = '-'
+    isPreparingTask.value = false
+    armedTaskId.value = null
+    isPSetSet.value = false
+    isToolEnabled.value = false
+    isDataSubscribed.value = false
   },
   resumeTighteningWorkflow: async () => {
     logLocal('info', `[流程] 人工确认完毕，等待 2s 后继续...`)
@@ -301,7 +356,13 @@ defineExpose({
   },
   resetWorkflow: () => {
     workflowAborted.value = false
+    isPreparingTask.value = false
+    armedTaskId.value = null
+    isPSetSet.value = false
+    isToolEnabled.value = false
+    isDataSubscribed.value = false
   }
+
 })
 
 </script>
@@ -325,7 +386,7 @@ defineExpose({
         </div>
       </div>
       <div class="actions">
-        <button v-if="!isConnected" class="btn connect" @click="handleConnect">🔗 连接接口 (MID 0001)</button>
+        <button v-if="!isConnected" class="btn connect" @click="handleConnect" :disabled="!isSignalRConnected">🔗 连接接口 (MID 0001)</button>
         <button v-else class="btn disconnect" @click="handleDisconnect">🔌 断开连接 (MID 0003)</button>
       </div>
     </div>
@@ -388,10 +449,9 @@ defineExpose({
           <button class="btn cmd lock" @click="lockTool" :disabled="!isConnected">
             🔒 锁定工具 (MID 0042)
           </button>
-          <button class="btn cmd outline" @click="subscribeData" :disabled="!isConnected">
-            📡 获取数据 (MID 0060)
-          </button>
         </div>
+
+
 
 
         <div class="logs-container">

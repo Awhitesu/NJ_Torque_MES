@@ -35,10 +35,14 @@ public class TorqueHub : Hub
             IsHeartbeat = false
         });
 
-        // 如果已经连接，也推送一个连接状态事件让前端绿灯亮
+        // 推送当前的控制器连接状态（同步指示灯）
         if (tcpConnected)
         {
-            await Clients.Caller.SendAsync("ControllerConnected");
+            await Clients.Caller.SendAsync("ReceiveStatus", "已连接");
+        }
+        else
+        {
+            await Clients.Caller.SendAsync("ReceiveStatus", "未连接");
         }
 
         await base.OnConnectedAsync();

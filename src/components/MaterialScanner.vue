@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, nextTick, onMounted } from 'vue'
+import { ref, watch, computed, nextTick } from 'vue'
 import type { RouteStep, WorkStep } from '../types/mes'
 
 const props = defineProps<{

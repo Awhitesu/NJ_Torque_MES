@@ -9,7 +9,7 @@ export default defineConfig({
     port: 5173,
     host: '0.0.0.0',
     proxy: {
-      // 将 /mes-api/* 代理到 MES 服务器，解决浏览器 CORS 问题
+      // 核心 MES API (8076 端口)
       '/mes-api': {
         target: 'http://172.25.57.144:8076',
         changeOrigin: true,
@@ -22,11 +22,23 @@ export default defineConfig({
             console.log('[MES代理请求]', req.method, req.url)
           })
         }
+      },
+      // MES 报工数据上传 (8072 端口)
+      '/mes-push': {
+        target: 'http://172.25.57.144:8072',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/mes-push/, ''),
+      },
+      // 本地 C# 后端 (5246 端口)
+      '/api': {
+        target: 'http://127.0.0.1:5246',
+        changeOrigin: true,
+        ws: true,
+        rewrite: (path) => path.replace(/^\/api/, '')
       }
     }
   },
   build: {
-    // 构建优化
     target: 'es2015',
     minify: 'esbuild'
   }

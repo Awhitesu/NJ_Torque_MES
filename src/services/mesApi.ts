@@ -65,10 +65,23 @@ export async function getRouteList(
  * POST /api/ProduceMessage/CompleteCheckInput
  */
 export async function completeCheckInput(
-  config: AppConfig,
+  _config: AppConfig,
   data: CompleteCheckInputRequest
 ): Promise<any> {
   const baseUrl = '/mes-api'
   return postRequest<any>(`${baseUrl}/api/ProduceMessage/CompleteCheckInput`, data)
 }
+
+/**
+ * 步骤四：报工数据上传
+ * POST /api/ProduceMessage/PushPackMessageToMes
+ */
+export async function pushPackMessageToMes(
+  _config: AppConfig,
+  data: any[] // 实际是一个数组，按工步分片
+): Promise<any> {
+  const baseUrl = '/mes-push'
+  return postRequest<any>(`${baseUrl}/api/ProduceMessage/PushPackMessageToMes`, data)
+}
+
 

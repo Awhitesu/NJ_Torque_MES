@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, nextTick } from 'vue'
-import type { AppConfig, OrderInfo, RouteStep, TestResult, WorkStep, TighteningTask } from './types/mes'
-import { getOrderByProcess, getRouteList, completeCheckInput } from './services/mesApi'
+import type { AppConfig, CompleteCheckInputRequest, OrderInfo, RouteStep, TestResult, WorkStep, TighteningTask } from './types/mes'
+import { getOrderByProcess, getRouteList, completeCheckInput, pushPackMessageToMes } from './services/mesApi'
 import ConfigModal from './components/ConfigModal.vue'
 import RouteTable from './components/RouteTable.vue'
 import ApiDetail from './components/ApiDetail.vue'
 import type { ApiRecord } from './components/ApiDetail.vue'
 import MaterialScanner from './components/MaterialScanner.vue'
 import TorqueInteraction from './components/TorqueInteraction.vue'
+import LoginModal from './components/LoginModal.vue'
+import type { User } from './types/mes'
 
 const CONFIG_KEY = 'mes_app_config_v2'
 const DEFAULT_CONFIG: AppConfig = {
@@ -15,8 +17,14 @@ const DEFAULT_CONFIG: AppConfig = {
   routeApiUrl: '/mes-api/api/OrderInfo/GetTechRouteListByCode',
   technicsProcessCode: 'CTP_P1240',
   desoutterIp: '192.168.5.212',
-  desoutterPort: 4545
+  desoutterPort: 4545,
+
+  logSavePath: 'C:\\NJ_Torque_Logs',
+  adminUsername: 'admin',
+  adminPassword: '123'
 }
+
+
 
 function loadConfig(): AppConfig {
   try {
@@ -28,6 +36,8 @@ function loadConfig(): AppConfig {
 
 const config = reactive<AppConfig>(loadConfig())
 const showConfig = ref(false)
+const showLogin = ref(false)
+const currentUser = ref<User | null>(null)
 const onConfigSaved = () => localStorage.setItem(CONFIG_KEY, JSON.stringify(config))
 
 const productCode = ref('')
@@ -52,6 +62,8 @@ const activeTab = ref<'route' | 'api' | 'log' | 'material' | 'torque'>('route')
 const torqueInteractionRef = ref<any>(null)
 const materialVerificationLoading = ref(false)
 const materialVerificationSuccess = ref(false)
+const verifiedMaterials = ref<any[]>([])
+const processStartTime = ref(new Date().toLocaleString())
 
 function addLog(level: any, msg: string) {
   logs.value.unshift({ time: new Date().toLocaleTimeString(), level, msg })
@@ -177,12 +189,12 @@ async function handleMaterialComplete(materials: { productCode: string, productC
   addLog('info', '正在提交全物料验证...')
   const t0 = Date.now()
 
-  const reqData = {
-    produceOrderCode: orderInfo.value.orderCode || orderInfo.value.order_Code || '',
-    routeNo: orderInfo.value.route_No || orderInfo.value.routeNo || '',
+  const reqData: CompleteCheckInputRequest = {
+    produceOrderCode: String(orderInfo.value.orderCode || orderInfo.value.order_Code || ''),
+    routeNo: String(orderInfo.value.route_No || orderInfo.value.routeNo || ''),
     technicsProcessCode: config.technicsProcessCode,
     tenantID: 'FD',
-    productMixCode: orderInfo.value.productMixCode || orderInfo.value.product_MixCode || 'null',
+    productMixCode: String(orderInfo.value.productMixCode || orderInfo.value.product_MixCode || 'null'),
     productLine: "",
     materialList: materials
   }
@@ -210,8 +222,10 @@ async function handleMaterialComplete(materials: { productCode: string, productC
       rec.status = 'success'
       addLog('success', '✅ 全物料验证通过！')
       materialVerificationSuccess.value = true
-      testResult.value = 'OK'
-      resultMessage.value = '物料验证成功，正在切换至定扭交互...'
+      verifiedMaterials.value = materials // 保存已验证的物料清单
+      testResult.value = 'IDLE' // 验证通过后状态回归待机，直到定扭开始
+      resultMessage.value = '物料验证通过，请执行定扭交互'
+
       
       setTimeout(() => {
         if (materialVerificationSuccess.value) {
@@ -289,22 +303,283 @@ function handleTaskFailed(failedTask: TighteningTask) {
   }
 }
 
-function handleAllTasksComplete() {
+async function handleAllTasksComplete() {
+  addLog('success', '🎉 所有定扭任务已完成！准备备份并报工...')
   testResult.value = 'OK'
-  resultMessage.value = '全部工步执行完毕，等待数据上传'
-  addLog('success', '🎉 当前产品所有定扭任务已完成！等待结果上传逻辑...')
+  resultMessage.value = '全部工序已完成，正在备份日志并报工...'
+  
+  // Submit MES first so the saved file contains the final upload request/response.
+  await submitAllDataToMes()
+  
+  // Save after submission, including both success and failure MES logs.
+  await saveAllLogsToLocal()
 }
 
 
-function resetResult() {
+async function submitAllDataToMes() {
+  if (!orderInfo.value) return
+
+  const t0 = Date.now()
+  const nowStr = new Date().toLocaleDateString()
+  const endTimeStr = new Date().toLocaleString()
+  
+  // 1. 构建物料绑定步 (STEP1)
+  const step1Payload = {
+    produceOrderCode: orderInfo.value.orderCode || orderInfo.value.order_Code || '',
+    routeNo: orderInfo.value.route_No || orderInfo.value.routeNo || '',
+    technicsProcessCode: config.technicsProcessCode,
+    technicsProcessName: "",
+    technicsStepCode: "STEP1",
+    technicsStepName: "物料绑定",
+    productCode: productCode.value,
+    productCount: verifiedMaterials.value.length,
+    productQuality: 0,
+    produceDate: nowStr,
+    startTime: processStartTime.value,
+    endTime: endTimeStr,
+    userName: currentUser.value?.username || "admin",
+    userAccount: currentUser.value?.username || "admin",
+    deviceCode: "",
+    Remarks: "",
+    ProduceInEntityList: verifiedMaterials.value.map(m => ({
+      productCode: m.productCode,
+      ProductCount: m.productCount
+    })),
+    produceParamEntityList: [],
+    ngEntityList: [],
+    cellParamEntityList: [],
+    otherParamEntityList: [],
+    deviceName: ""
+  }
+
+  // 2. 按工步对定扭任务进行分组 (STEP2, STEP3...)
+  const torqueGroups = new Map<string, TighteningTask[]>()
+  tighteningTasks.value.forEach(t => {
+    const list = torqueGroups.get(t.workstepNo) || []
+    list.push(t)
+    torqueGroups.set(t.workstepNo, list)
+  })
+
+  const torquePayloads = Array.from(torqueGroups.entries()).map(([stepNo, tasks]) => {
+    return {
+      produceOrderCode: orderInfo.value!.orderCode || orderInfo.value!.order_Code || '',
+      routeNo: orderInfo.value!.route_No || orderInfo.value!.routeNo || '',
+      technicsProcessCode: config.technicsProcessCode,
+      technicsProcessName: "",
+      technicsStepCode: stepNo, // 假设接口二返回的 workseqNo 对应 STEP2, STEP3...
+      technicsStepName: tasks[0].workstepName,
+      productCode: productCode.value,
+      productCount: tasks.length,
+      productQuality: tasks.every(t => t.result === 'PASS') ? 0 : 1,
+      produceDate: nowStr,
+      startTime: processStartTime.value,
+      endTime: endTimeStr,
+      userName: currentUser.value?.username || "admin",
+      userAccount: currentUser.value?.username || "admin",
+      deviceCode: "",
+      Remarks: "",
+      ProduceInEntityList: [],
+      produceParamEntityList: [],
+      ngEntityList: [],
+      cellParamEntityList: [],
+      otherParamEntityList: tasks.map(t => ({
+        productCode: `bolt_${t.screwIndex}`,
+        otherInfoList: [
+          {
+            technicsParamName: "定扭扭矩",
+            technicsParamCode: "DN0001",
+            technicsParamValue: t.actualTorque || "0",
+            desc: "定扭扭矩",
+            technicsParamQuality: t.result === 'PASS' ? "0" : "1"
+          },
+          {
+            technicsParamName: "定扭角度",
+            technicsParamCode: "DN0002",
+            technicsParamValue: t.actualAngle || "0",
+            desc: "定扭角度",
+            technicsParamQuality: t.result === 'PASS' ? "0" : "1"
+          },
+          {
+            technicsParamName: "程序号",
+            technicsParamCode: "DN0005",
+            technicsParamValue: t.pSetNo,
+            desc: "程序号",
+            technicsParamQuality: "0"
+          },
+          {
+            technicsParamName: "定扭时间",
+            technicsParamCode: "DN0007",
+            technicsParamValue: t.timestamp || endTimeStr,
+            desc: "定扭时间",
+            technicsParamQuality: "0"
+          }
+        ]
+      })),
+      deviceName: ""
+    }
+  })
+
+  const finalPayload = [step1Payload, ...torquePayloads]
+  
+  const rec = reactive<ApiRecord>({ 
+    title: 'MES 报工上传', 
+    url: '/mes-push/api/ProduceMessage/PushPackMessageToMes', 
+    status: 'pending', 
+    time: new Date().toLocaleTimeString(), 
+    reqBody: finalPayload 
+  })
+  apiRecords.value.unshift(rec)
+  addLog('info', `[MES] 开始汇总报工数据 (共 ${finalPayload.length} 个工步)`)
+
+  try {
+    const res = await pushPackMessageToMes(config, finalPayload)
+    rec.duration = Date.now() - t0
+    rec.resBody = res
+    if (res && (res.code === 200 || res.success === true)) {
+      rec.status = 'success'
+      addLog('success', '✅ MES 报工完成: 结果已成功推送到生产服务器')
+      resultMessage.value = '报工已成功，当前流程已全部完成。'
+    } else {
+      rec.status = 'error'
+      const failMsg = res?.message || res?.msg || '服务器拒绝'
+      addLog('error', `❌ MES 报工失败: ${failMsg}`)
+      resultMessage.value = `报工失败: ${failMsg}`
+    }
+  } catch (err: any) {
+    rec.status = 'error'
+    rec.resBody = err.message
+    addLog('error', `❌ MES 报工网络异常: ${err.message}`)
+    resultMessage.value = `网络异常，报工未完成: ${err.message}`
+  }
+}
+
+
+async function saveAllLogsToLocal() {
+  addLog('info', `[System] 正在发起日志备份请求... (条码: ${productCode.value || '无条码'})`)
+
+  const barcode = productCode.value.trim() || 'NoBarcode'
+
+  const now = new Date()
+  const timestamp = now.getFullYear().toString() + 
+                    (now.getMonth() + 1).toString().padStart(2, '0') + 
+                    now.getDate().toString().padStart(2, '0') + "_" +
+                    now.getHours().toString().padStart(2, '0') + 
+                    now.getMinutes().toString().padStart(2, '0') + 
+                    now.getSeconds().toString().padStart(2, '0')
+  
+  const fileName = `${barcode}_${timestamp}.txt`
+  
+  // 组合日志内容
+  let content = `================================================\n`
+  content += `NJ_Torque_MES 生产执行记录\n`
+  content += `产品条码: ${barcode}\n`
+  content += `保存时间: ${now.toLocaleString()}\n`
+  content += `================================================\n\n`
+  
+  content += `【操作日志】\n`
+  logs.value.slice().reverse().forEach(l => {
+    content += `[${l.time}] [${l.level.toUpperCase()}] ${l.msg}\n`
+  })
+  
+  content += `\n【接口交互记录】\n`
+  apiRecords.value.slice().reverse().forEach(r => {
+    content += `------------------------------------------------\n`
+    content += `时间: ${r.time} | 状态: ${r.status.toUpperCase()} | 耗时: ${r.duration || 0}ms\n`
+    content += `标题: ${r.title}\n`
+    content += `请求: ${JSON.stringify(r.reqBody, null, 2)}\n`
+    content += `响应: ${JSON.stringify(r.resBody, null, 2)}\n`
+  })
+  
+  try {
+    const response = await fetch('http://127.0.0.1:5246/saveLogs', {
+
+
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        FileName: fileName,
+        Content: content,
+        Path: config.logSavePath
+      })
+    })
+    
+    if (response.ok) {
+       const text = await response.text();
+       try {
+         const resData = JSON.parse(text);
+         addLog('success', `[System] 日志已自动备份至本地: ${resData.path}`)
+       } catch {
+         addLog('success', '[System] 日志备份请求已发送，但后台未返回确认信息')
+       }
+    } else {
+       const text = await response.text();
+       addLog('error', `[System] 后台保存失败 (HTTP ${response.status}): ${text.substring(0, 100)}`)
+    }
+  } catch (err) {
+    addLog('error', `[System] 通讯异常: ${err}`)
+  }
+
+}
+
+
+
+
+
+async function resetResult() {
+  // 核心判定：只要输入了条码，且没有达到最终的“全部完成”状态，就需要管理员授权
+  const isFinished = testResult.value === 'OK' && resultMessage.value.includes('已完成')
+  const hasStarted = productCode.value.trim() !== ''
+
+  if (hasStarted && !isFinished) {
+     showLogin.value = true
+     return
+  }
+  await executeReset()
+}
+
+
+async function handleAuthSuccess(user: User) {
+  currentUser.value = user
+  addLog('warn', `管理员 [${user.username}] 授权：执行强制复位`)
+  await executeReset()
+  currentUser.value = null // 授权完重置身份
+}
+
+async function executeReset() {
+  // 1. 尝试保存日志（不阻塞 UI 复位）
+  if (productCode.value) {
+    addLog('info', '正在后台备份当前流程日志...')
+    saveAllLogsToLocal().catch(err => {
+      console.error('备份失败:', err)
+      addLog('error', '[System] 自动备份过程发生错误')
+    })
+  }
+
+  // 2. 彻底清理前端状态，回到初始扫码状态
+  productCode.value = ''
+  orderInfo.value = null
+  routeSteps.value = []
+  materialVerificationSuccess.value = false
   testResult.value = 'IDLE'
   resultMessage.value = ''
+  activeTab.value = 'route' // 回到第一步标签页
+  
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.abortWorkflow()
-    setTimeout(() => torqueInteractionRef.value?.resetWorkflow(), 100)
+    setTimeout(() => {
+      torqueInteractionRef.value?.resetWorkflow()
+    }, 100)
   }
-  addLog('info', '状态已复位，等待下一件')
+
+  addLog('info', '----------------------------------------')
+  addLog('info', '✅ 系统已全面复位，请扫描新工单')
+  
+  // 重新聚焦扫码框
+  focusScan()
 }
+
+
+
 </script>
 
 <template>
@@ -415,12 +690,14 @@ function resetResult() {
           </div>
 
           <button
-            v-if="testResult !== 'IDLE'"
+            v-if="productCode.trim() !== ''"
             class="btn-reset"
             @click="resetResult"
           >
             🔄 复位状态 / 准备下一件
           </button>
+
+
         </div>
       </section>
 
@@ -598,8 +875,17 @@ function resetResult() {
       v-model:visible="showConfig"
       @save="onConfigSaved"
     />
+
+    <LoginModal
+      v-model:visible="showLogin"
+      :admin-user="config.adminUsername"
+      :admin-pass="config.adminPassword"
+      @auth-success="handleAuthSuccess"
+    />
+
   </div>
 </template>
+
 
 <style scoped>
 /* 鏍瑰鍣?*/

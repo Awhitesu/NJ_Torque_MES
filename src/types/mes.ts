@@ -12,6 +12,12 @@ export interface AppConfig {
   desoutterIp: string
   /** 定扭枪端口 */
   desoutterPort: number
+  /** 日志保存路径 */
+  logSavePath?: string
+  /** 管理员用户名 */
+  adminUsername?: string
+  /** 管理员密码 */
+  adminPassword?: string
 }
 
 /** 获取工单请求参数 */
@@ -26,6 +32,7 @@ export interface GetOrderRequest {
  */
 export interface OrderInfo {
   orderCode: string
+
   route_No: string       // 注意：实际字段名带下划线
   specsCode?: string
   cell_Level?: string | null
@@ -178,4 +185,49 @@ export interface CompleteCheckInputRequest {
   productMixCode: string | null
   productLine: string
   materialList: MaterialItem[]
+}
+
+export type UserRole = 'admin' | 'operator'
+
+export interface User {
+  username: string
+  role: UserRole
+}
+
+/** MES 最终报工数据结构 */
+export interface MesSubmission {
+  produceOrderCode: string
+  routeNo: string
+  technicsProcessCode: string
+  technicsProcessName: string
+  technicsStepCode: string
+  technicsStepName: string
+  productCode: string
+  productCount: number
+  productQuality: number // 0:OK, 1:NG
+  produceDate: string
+  startTime: string
+  endTime: string
+  userName: string
+  userAccount: string
+  deviceCode: string
+  Remarks: string
+  ProduceInEntityList: Array<{
+    productCode: string
+    ProductCount: number
+  }>
+  produceParamEntityList: any[]
+  ngEntityList: any[]
+  cellParamEntityList: any[]
+  otherParamEntityList: Array<{
+    productCode: string // 这里通常存 bolt_1, bolt_2 等
+    otherInfoList: Array<{
+      technicsParamName: string
+      technicsParamCode: string
+      technicsParamValue: string
+      desc: string
+      technicsParamQuality: string // "0":OK, "1":NG
+    }>
+  }>
+  deviceName: string
 }

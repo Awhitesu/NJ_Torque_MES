@@ -93,7 +93,39 @@ function handleCancel() {
               />
             </div>
           </div>
+
+          <div class="field-group">
+            <label>本地日志保存路径 (Server Side)</label>
+            <input
+              v-model="form.logSavePath"
+              type="text"
+              placeholder="C:\MES_Logs"
+              class="input-field"
+            />
+            <small>定扭完成后，日志将以此路径保存到后台服务器所在电脑</small>
+          </div>
+
+          <div class="field-groups-row" style="display: flex; gap: 16px; margin-top: 10px;">
+            <div class="field-group" style="flex: 1;">
+              <label>管理员账号 (强制复位用)</label>
+              <input
+                v-model="form.adminUsername"
+                type="text"
+                class="input-field"
+              />
+            </div>
+            <div class="field-group" style="flex: 1;">
+              <label>管理员密码</label>
+              <input
+                v-model="form.adminPassword"
+                type="password"
+                class="input-field"
+              />
+            </div>
+          </div>
         </div>
+
+
 
         <div class="modal-footer">
           <button class="btn-cancel" @click="handleCancel">取消</button>
