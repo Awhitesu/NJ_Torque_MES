@@ -1,6 +1,7 @@
-<script setup lang="ts">
-import { reactive } from 'vue'
+﻿<script setup lang="ts">
+import { reactive, ref, watch } from 'vue'
 import type { AppConfig } from '../types/mes'
+import { pickConfigDirectory } from '../services/appConfigApi'
 
 const props = defineProps<{
   modelValue: AppConfig
@@ -13,8 +14,21 @@ const emit = defineEmits<{
   (e: 'save'): void
 }>()
 
-// 本地表单副本
 const form = reactive<AppConfig>({ ...props.modelValue })
+const pickingLogPath = ref(false)
+
+watch(
+  () => props.modelValue,
+  (val) => Object.assign(form, val),
+  { deep: true }
+)
+
+watch(
+  () => props.visible,
+  (v) => {
+    if (v) Object.assign(form, props.modelValue)
+  }
+)
 
 function handleSave() {
   emit('update:modelValue', { ...form })
@@ -23,9 +37,18 @@ function handleSave() {
 }
 
 function handleCancel() {
-  // 还原
   Object.assign(form, props.modelValue)
   emit('update:visible', false)
+}
+
+async function handlePickLogPath() {
+  pickingLogPath.value = true
+  try {
+    const res = await pickConfigDirectory('请选择日志保存目录')
+    if (res?.path) form.logSavePath = res.path
+  } finally {
+    pickingLogPath.value = false
+  }
 }
 </script>
 
@@ -40,15 +63,51 @@ function handleCancel() {
         </div>
 
         <div class="modal-body">
+          <div class="section-title">系统参数设置</div>
+          <div class="field-group">
+            <label>本地日志保存路径 (Server Side)</label>
+            <div class="dir-row">
+              <input
+                v-model="form.logSavePath"
+                type="text"
+                placeholder="C:\\MES_Logs"
+                class="input-field"
+              />
+              <button class="btn-pick" type="button" :disabled="pickingLogPath" @click="handlePickLogPath">
+                {{ pickingLogPath ? '选择中...' : '选择目录' }}
+              </button>
+            </div>
+            <small>目录选择窗口从最顶层开始显示，优先便于快速选择目标目录。</small>
+          </div>
+
+          <div class="field-groups-row" style="display: flex; gap: 16px; margin-top: 10px;">
+            <div class="field-group" style="flex: 1;">
+              <label>管理员账户</label>
+              <input
+                v-model="form.adminUsername"
+                type="text"
+                class="input-field"
+              />
+            </div>
+            <div class="field-group" style="flex: 1;">
+              <label>管理员密码</label>
+              <input
+                v-model="form.adminPassword"
+                type="password"
+                class="input-field"
+              />
+            </div>
+          </div>
+
+          <div class="section-title">MES 参数设置</div>
           <div class="field-group">
             <label>获取工单 API 地址</label>
             <input
               v-model="form.orderApiUrl"
               type="text"
-              placeholder="http://172.25.57.144:8076/api/0rderInfo/GetOtherOrderInfoByProcess"
+              placeholder="/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess"
               class="input-field"
             />
-            <small>POST 请求地址（非首段工序获取工单）</small>
           </div>
 
           <div class="field-group">
@@ -56,23 +115,98 @@ function handleCancel() {
             <input
               v-model="form.routeApiUrl"
               type="text"
-              placeholder="http://172.25.57.144:8076/api/0rderInfo/GetTechRouteListByCode"
+              placeholder="/mes-api/api/OrderInfo/GetTechRouteListByCode"
               class="input-field"
             />
-            <small>POST 请求地址（工步工序列表）</small>
           </div>
 
           <div class="field-group">
-            <label>工序代码（technicsProcessCode）</label>
+            <label>单物料验证 URL</label>
+            <input
+              v-model="form.singleMaterialApiUrl"
+              type="text"
+              placeholder="/mes-api/api/ProduceMessage/SingleCheckInput"
+              class="input-field"
+            />
+          </div>
+
+          <div class="field-group">
+            <label>全物料验证 URL</label>
+            <input
+              v-model="form.fullMaterialApiUrl"
+              type="text"
+              placeholder="/mes-api/api/ProduceMessage/CompleteCheckInput"
+              class="input-field"
+            />
+          </div>
+
+          <div class="field-group">
+            <label>MES 数据上传 URL</label>
+            <input
+              v-model="form.mesUploadApiUrl"
+              type="text"
+              placeholder="/mes-push/api/ProduceMessage/PushPackMessageToMes"
+              class="input-field"
+            />
+          </div>
+
+          <div class="field-group">
+            <label>工序代码 (technicsProcessCode)</label>
             <input
               v-model="form.technicsProcessCode"
               type="text"
-              placeholder="请输入工序代码"
               class="input-field"
             />
-            <small>当前工位对应的工序代码</small>
           </div>
 
+          <div class="field-group">
+            <label>工序名称 (technicsProcessName)</label>
+            <input
+              v-model="form.technicsProcessName"
+              type="text"
+              class="input-field"
+            />
+          </div>
+
+          <div class="field-groups-row" style="display: flex; gap: 16px;">
+            <div class="field-group" style="flex: 1;">
+              <label>userName</label>
+              <input
+                v-model="form.userName"
+                type="text"
+                class="input-field"
+              />
+            </div>
+            <div class="field-group" style="flex: 1;">
+              <label>userAccount</label>
+              <input
+                v-model="form.userAccount"
+                type="text"
+                class="input-field"
+              />
+            </div>
+          </div>
+
+          <div class="field-groups-row" style="display: flex; gap: 16px;">
+            <div class="field-group" style="flex: 1;">
+              <label>deviceCode</label>
+              <input
+                v-model="form.deviceCode"
+                type="text"
+                class="input-field"
+              />
+            </div>
+            <div class="field-group" style="flex: 1;">
+              <label>deviceName</label>
+              <input
+                v-model="form.deviceName"
+                type="text"
+                class="input-field"
+              />
+            </div>
+          </div>
+
+          <div class="section-title">定扭控制器参数设置</div>
           <div class="field-groups-row" style="display: flex; gap: 16px;">
             <div class="field-group" style="flex: 2;">
               <label>定扭控制器 IP (Desoutter Open Protocol)</label>
@@ -94,38 +228,38 @@ function handleCancel() {
             </div>
           </div>
 
+          <div class="section-title">扫码枪参数设置</div>
+          <div class="field-groups-row" style="display: flex; gap: 16px;">
+            <div class="field-group" style="flex: 2;">
+              <label>扫码枪 IP (Scanner TCP)</label>
+              <input
+                v-model="form.scannerIp"
+                type="text"
+                placeholder="192.168.x.x"
+                class="input-field"
+              />
+            </div>
+            <div class="field-group" style="flex: 1;">
+              <label>扫码枪端口</label>
+              <input
+                v-model.number="form.scannerPort"
+                type="number"
+                placeholder="2000"
+                class="input-field"
+              />
+            </div>
+          </div>
+
           <div class="field-group">
-            <label>本地日志保存路径 (Server Side)</label>
+            <label>扫码条码正则 (barcodeRegex)</label>
             <input
-              v-model="form.logSavePath"
+              v-model="form.barcodeRegex"
               type="text"
-              placeholder="C:\MES_Logs"
+              placeholder=".*"
               class="input-field"
             />
-            <small>定扭完成后，日志将以此路径保存到后台服务器所在电脑</small>
-          </div>
-
-          <div class="field-groups-row" style="display: flex; gap: 16px; margin-top: 10px;">
-            <div class="field-group" style="flex: 1;">
-              <label>管理员账号 (强制复位用)</label>
-              <input
-                v-model="form.adminUsername"
-                type="text"
-                class="input-field"
-              />
-            </div>
-            <div class="field-group" style="flex: 1;">
-              <label>管理员密码</label>
-              <input
-                v-model="form.adminPassword"
-                type="password"
-                class="input-field"
-              />
-            </div>
           </div>
         </div>
-
-
 
         <div class="modal-footer">
           <button class="btn-cancel" @click="handleCancel">取消</button>
@@ -145,7 +279,7 @@ function handleCancel() {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  z-index: 99999;
 }
 
 .modal-panel {
@@ -154,8 +288,11 @@ function handleCancel() {
   border-radius: 12px;
   width: 560px;
   max-width: 95vw;
+  max-height: 90vh;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-header {
@@ -189,6 +326,7 @@ function handleCancel() {
   border-radius: 4px;
   transition: background 0.2s;
 }
+
 .close-btn:hover {
   background: rgba(255, 255, 255, 0.1);
 }
@@ -198,6 +336,28 @@ function handleCancel() {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.modal-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.modal-body::-webkit-scrollbar-thumb {
+  background: rgba(100, 181, 246, 0.35);
+  border-radius: 3px;
+}
+
+.section-title {
+  font-size: 12px;
+  color: #64b5f6;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 6px 10px;
+  border-left: 3px solid #1976d2;
+  background: rgba(25, 118, 210, 0.08);
+  border-radius: 4px;
 }
 
 .field-group {
@@ -239,6 +399,26 @@ function handleCancel() {
   color: #37474f;
 }
 
+.dir-row {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-pick {
+  min-width: 92px;
+  border-radius: 6px;
+  border: 1px solid rgba(100, 181, 246, 0.3);
+  background: rgba(100, 181, 246, 0.12);
+  color: #90caf9;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.btn-pick:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .modal-footer {
   padding: 16px 24px;
   display: flex;
@@ -257,6 +437,7 @@ function handleCancel() {
   cursor: pointer;
   transition: all 0.2s;
 }
+
 .btn-cancel:hover {
   border-color: #42a5f5;
   color: #42a5f5;
@@ -273,6 +454,7 @@ function handleCancel() {
   cursor: pointer;
   transition: all 0.2s;
 }
+
 .btn-save:hover {
   background: linear-gradient(135deg, #1976d2, #1565c0);
   box-shadow: 0 4px 16px rgba(21, 101, 192, 0.4);
@@ -282,17 +464,21 @@ function handleCancel() {
 .modal-leave-active {
   transition: opacity 0.25s ease;
 }
+
 .modal-enter-from,
 .modal-leave-to {
   opacity: 0;
 }
+
 .modal-enter-active .modal-panel,
 .modal-leave-active .modal-panel {
   transition: transform 0.25s ease;
 }
+
 .modal-enter-from .modal-panel {
   transform: scale(0.92) translateY(-20px);
 }
+
 .modal-leave-to .modal-panel {
   transform: scale(0.92) translateY(-20px);
 }

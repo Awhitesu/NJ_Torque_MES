@@ -16,4 +16,8 @@
     </PackageReference>
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\SCAN\Backend\BarcodeScannerModule.cs" Link="Modules\Scan\BarcodeScannerModule.cs" />
+  </ItemGroup>
+
 </Project>

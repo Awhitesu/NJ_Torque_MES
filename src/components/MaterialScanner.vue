@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, nextTick } from 'vue'
+import { ref, watch, computed } from 'vue'
 import type { RouteStep, WorkStep } from '../types/mes'
 
 const props = defineProps<{
@@ -27,8 +27,7 @@ export interface MaterialTask {
 }
 
 const taskList = ref<MaterialTask[]>([])
-const scanInput = ref('')
-const inputRef = ref<HTMLInputElement | null>(null)
+const lastScannedCode = ref('')
 
 // 提取所有物料，生成任务列表
 function buildTasks() {
@@ -68,9 +67,6 @@ watch(
   () => props.steps,
   () => {
     buildTasks()
-    if (taskList.value.length > 0) {
-      nextTick(() => inputRef.value?.focus())
-    }
   },
   { immediate: true, deep: true }
 )
@@ -82,9 +78,10 @@ const isAllCompleted = computed(() => {
 
 
 
-function handleScan() {
-  const code = scanInput.value.trim()
+function handleIncomingCode(rawCode: string) {
+  const code = rawCode.trim()
   if (!code) return
+  lastScannedCode.value = code
 
   // 匹配逻辑：
   // 1. 还没完成的 (status === 'pending')
@@ -130,32 +127,24 @@ function handleScan() {
   } else {
     emit('log', 'error', `扫码无匹配物料或该物料已扫完: ${code}`)
   }
-
-  // 清空输入框以便连续扫码
-  scanInput.value = ''
 }
+
+defineExpose({
+  consumeScannedCode: (code: string) => {
+    handleIncomingCode(code)
+  }
+})
 </script>
 
 <template>
   <div class="material-scanner-panel">
     <div class="scan-action-bar">
       <div class="scan-input-wrapper">
-        <span class="icon">🔍</span>
-        <input
-          ref="inputRef"
-          type="text"
-          class="scan-input"
-          v-model="scanInput"
-          @keyup.enter="handleScan"
-          placeholder="请使用扫码枪扫描物料条码以验证组件..."
-          autocomplete="off"
-          :disabled="isAllCompleted || !taskList.length"
-        />
-        <button 
-          class="submit-btn" 
-          @click="handleScan"
-          :disabled="isAllCompleted || !taskList.length"
-        >验证</button>
+        <span class="icon">🔫</span>
+        <div class="scanner-only-text">
+          扫码枪监听中（已禁用人工输入）
+          <span v-if="lastScannedCode" class="last-code">最近扫码: {{ lastScannedCode }}</span>
+        </div>
       </div>
       
       <div class="progress-status" v-if="taskList.length">
@@ -252,12 +241,7 @@ function handleScan() {
   background: #0d1117;
   border: 1px solid rgba(100, 181, 246, 0.3);
   border-radius: 6px;
-  padding: 4px 6px;
-}
-
-.scan-input-wrapper:focus-within {
-  border-color: #42a5f5;
-  box-shadow: 0 0 0 2px rgba(66, 165, 245, 0.2);
+  padding: 10px 12px;
 }
 
 .scan-input-wrapper .icon {
@@ -265,29 +249,20 @@ function handleScan() {
   opacity: 0.6;
 }
 
-.scan-input {
+.scanner-only-text {
   flex: 1;
-  background: transparent;
-  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   color: #e3f2fd;
-  font-family: inherit;
-  font-size: 14px;
-  outline: none;
+  font-size: 13px;
 }
-.scan-input:disabled { opacity: 0.5; }
 
-.submit-btn {
-  background: #1976d2;
-  color: white;
-  border: none;
-  padding: 6px 14px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-weight: 600;
-  transition: all 0.2s;
+.last-code {
+  color: #80cbc4;
+  font-family: 'Consolas', monospace;
+  font-size: 12px;
 }
-.submit-btn:hover:not(:disabled) { background: #1565c0; }
-.submit-btn:disabled { background: #37474f; color: #78909c; cursor: not-allowed; }
 
 .progress-status {
   font-size: 13px;

@@ -6,12 +6,31 @@ export interface AppConfig {
   orderApiUrl: string
   /** 工步工序API地址 */
   routeApiUrl: string
+  singleMaterialApiUrl: string
+  fullMaterialApiUrl: string
+  mesUploadApiUrl: string
   /** 工序代码 */
   technicsProcessCode: string
+  /** 工序名称 */
+  technicsProcessName: string
+  /** 报工用户名 */
+  userName: string
+  /** 报工用户账号 */
+  userAccount: string
+  /** 设备编码 */
+  deviceCode: string
+  /** 设备名称 */
+  deviceName: string
   /** 定扭枪 IP */
   desoutterIp: string
   /** 定扭枪端口 */
   desoutterPort: number
+  /** 扫码枪 IP */
+  scannerIp: string
+  /** 扫码枪端口 */
+  scannerPort: number
+  /** 条码正则（透传后端模块） */
+  barcodeRegex: string
   /** 日志保存路径 */
   logSavePath?: string
   /** 管理员用户名 */

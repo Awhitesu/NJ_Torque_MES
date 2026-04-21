@@ -8,20 +8,31 @@ namespace MesScanner.Backend.Services;
 
 public class TorqueControllerService : BackgroundService
 {
+    private const int AutoReconnectIntervalMs = 10_000;
     private readonly ILogger<TorqueControllerService> _logger;
     private readonly IHubContext<TorqueHub> _hubContext;
+    private readonly object _configLock = new();
     private TcpClient? _tcpClient;
     private NetworkStream? _stream;
-    private readonly string _ip = "192.168.5.212";
-    private readonly int _port = 4545;
+    private string _ip;
+    private int _port;
+    private bool _transportConnected = false;
     private bool _isConnected = false;
+    private bool _allowConnection = true;
     public bool IsConnected => _isConnected;
     private DateTime _lastPacketTime = DateTime.MinValue;
 
-    public TorqueControllerService(ILogger<TorqueControllerService> logger, IHubContext<TorqueHub> hubContext)
+    public TorqueControllerService(
+        ILogger<TorqueControllerService> logger,
+        IHubContext<TorqueHub> hubContext,
+        AppConfigFileService appConfigFileService)
     {
         _logger = logger;
         _hubContext = hubContext;
+
+        var cfg = appConfigFileService.GetDto();
+        _ip = string.IsNullOrWhiteSpace(cfg.DesoutterIp) ? "192.168.5.212" : cfg.DesoutterIp.Trim();
+        _port = cfg.DesoutterPort > 0 ? cfg.DesoutterPort : 4545;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -33,11 +44,11 @@ public class TorqueControllerService : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (!_isConnected)
+            if (!_transportConnected && _allowConnection)
             {
                 await ConnectAndHandshakeAsync();
             }
-            await Task.Delay(5000, stoppingToken);
+            await Task.Delay(AutoReconnectIntervalMs, stoppingToken);
         }
     }
 
@@ -57,24 +68,32 @@ public class TorqueControllerService : BackgroundService
     {
         try
         {
-            Console.WriteLine($"\n[Service] {DateTime.Now:HH:mm:ss} >>> 尝试连接控制器: {_ip}:{_port}");
+            string ip;
+            int port;
+            lock (_configLock)
+            {
+                ip = _ip;
+                port = _port;
+            }
+
+            Console.WriteLine($"\n[Service] {DateTime.Now:HH:mm:ss} >>> 尝试连接控制器: {ip}:{port}");
             _tcpClient = new TcpClient();
             
             using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
             {
-                await _tcpClient.ConnectAsync(_ip, _port, cts.Token);
+                await _tcpClient.ConnectAsync(ip, port, cts.Token);
             }
 
             if (_tcpClient.Connected)
             {
                 _stream = _tcpClient.GetStream();
-                _isConnected = true; // 只要 TCP 通了就认为已连接，方便前端操作
-                Console.WriteLine($"[Service] {DateTime.Now:HH:mm:ss} ✔ 物理成功连上控制器！");
-                await LogToFrontend("success", "[System] TCP 链路已连通");
-                await _hubContext.Clients.All.SendAsync("ReceiveStatus", "已连接");
+                _transportConnected = true;
+                _isConnected = false; // 仅 MID 0002 握手成功后才置 true
+                Console.WriteLine($"[Service] {DateTime.Now:HH:mm:ss} ✔ TCP链路已建立，等待 MID 0002 握手...");
+                await LogToFrontend("info", "[System] TCP 链路已建立，等待握手确认 (MID 0002)");
 
                 await Task.Delay(500); 
-                await SendPacketAsync("00200001001         "); 
+                await SendPacketAsync("00200001001         ", allowWhenNotReady: true); 
                 
                 // 开启读取循环
                 _ = Task.Run(() => ReadLoopAsync());
@@ -83,15 +102,55 @@ public class TorqueControllerService : BackgroundService
         catch (Exception ex)
         {
             Console.WriteLine($"[Service] {DateTime.Now:HH:mm:ss} ✘ 连接异常: {ex.Message}");
+            _transportConnected = false;
             _isConnected = false;
         }
     }
 
-    public async Task SendPacketAsync(string asciiStr)
+    public (string Ip, int Port) GetControllerEndpoint()
+    {
+        lock (_configLock)
+        {
+            return (_ip, _port);
+        }
+    }
+
+    public async Task UpdateControllerEndpointAsync(string ip, int port, bool reconnect = false)
+    {
+        lock (_configLock)
+        {
+            _ip = ip.Trim();
+            _port = port;
+        }
+
+        await LogToFrontend("info", $"[System] 控制器目标地址已更新: {_ip}:{_port}");
+        Console.WriteLine($"[Service] 控制器地址更新为: {_ip}:{_port}, reconnect={reconnect}");
+
+        if (reconnect)
+        {
+            _allowConnection = true;
+            await DisconnectInternalAsync(sendCloseMid: true, notifyFrontend: false);
+            await ConnectAndHandshakeAsync();
+        }
+    }
+
+    public async Task DisconnectAsync()
+    {
+        _allowConnection = false;
+        await DisconnectInternalAsync(sendCloseMid: true, notifyFrontend: true);
+    }
+
+    public async Task SendPacketAsync(string asciiStr, bool allowWhenNotReady = false)
     {
         try 
         {
-            if (_stream == null) return;
+            if (_stream == null || !_transportConnected || (!_isConnected && !allowWhenNotReady))
+            {
+                var warn = "[System] 控制器未连接，命令未发送";
+                Console.WriteLine($"[Service] {warn}");
+                await LogToFrontend("warn", warn);
+                return;
+            }
             
             byte[] asciiData = Encoding.ASCII.GetBytes(asciiStr);
             byte[] fullPacket = new byte[asciiData.Length + 1];
@@ -111,6 +170,7 @@ public class TorqueControllerService : BackgroundService
         catch (Exception ex)
         {
             Console.WriteLine($"[Service] 发送失败: {ex.Message}");
+            _transportConnected = false;
             _isConnected = false;
         }
     }
@@ -120,7 +180,7 @@ public class TorqueControllerService : BackgroundService
         byte[] buffer = new byte[2048];
         try
         {
-            while (_isConnected && _tcpClient != null && _tcpClient.Connected)
+            while (_transportConnected && _tcpClient != null && _tcpClient.Connected)
             {
                 int bytesRead = await _stream!.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0) break;
@@ -136,7 +196,18 @@ public class TorqueControllerService : BackgroundService
             }
         }
         catch { }
-        finally { _isConnected = false; }
+        finally
+        {
+            _transportConnected = false;
+            _isConnected = false;
+            CleanupSocket();
+
+            if (_allowConnection)
+            {
+                await LogToFrontend("warn", "[System] 控制器连接断开，等待自动重连...");
+                await _hubContext.Clients.All.SendAsync("ReceiveStatus", "未连接");
+            }
+        }
     }
 
 
@@ -172,7 +243,7 @@ public class TorqueControllerService : BackgroundService
         // 处理握手成功 (MID 0002)
         if (mid == "0002")
         {
-            _isConnected = true; // 握手成功才算真正连接
+            _isConnected = true;
             Console.WriteLine($"[Service] 🤝 MID 0001 握手成功！系统就绪。");
             await LogToFrontend("success", "[System] 控制器握手成功 (MID 0002)");
             await _hubContext.Clients.All.SendAsync("ReceiveStatus", "已连接");
@@ -233,11 +304,44 @@ public class TorqueControllerService : BackgroundService
         });
     }
 
+    private void CleanupSocket()
+    {
+        try { _stream?.Close(); } catch { }
+        try { _tcpClient?.Close(); } catch { }
+        _stream = null;
+        _tcpClient = null;
+    }
+
+    private async Task DisconnectInternalAsync(bool sendCloseMid, bool notifyFrontend)
+    {
+        if (sendCloseMid && _isConnected)
+        {
+            try
+            {
+                await SendPacketAsync("00200003001         ");
+                await Task.Delay(100);
+            }
+            catch { }
+        }
+
+        _isConnected = false;
+        _transportConnected = false;
+        CleanupSocket();
+
+        if (notifyFrontend)
+        {
+            await LogToFrontend("warn", "[System] 控制器连接已断开");
+            await _hubContext.Clients.All.SendAsync("ReceiveStatus", "未连接");
+        }
+    }
+
     /// <summary>
     /// 前端手动触发重连：如果当前未连接，立即发起一次 TCP 握手
     /// </summary>
     public async Task TriggerReconnectAsync()
     {
+        _allowConnection = true;
+
         if (_isConnected)
         {
             Console.WriteLine("[Service] 已连接，无需重连");

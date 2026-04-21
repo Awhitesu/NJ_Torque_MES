@@ -1,24 +1,34 @@
-<script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+﻿<script setup lang="ts">
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { HubConnectionBuilder, LogLevel } from '@microsoft/signalr'
 import type { TighteningTask } from '../types/mes'
+
+type UiLogLevel = 'info' | 'success' | 'warn' | 'error'
+
+interface LocalLog {
+  time: string
+  level: UiLogLevel
+  msg: string
+}
 
 const props = defineProps<{
   ip: string
   port: number
   tasks: TighteningTask[]
+  manualCommandAuthorized: boolean
 }>()
 
 const emit = defineEmits<{
-  (e: 'log', level: 'info'|'success'|'warn'|'error', msg: string): void
+  (e: 'log', level: UiLogLevel, msg: string): void
   (e: 'update:tasks', tasks: TighteningTask[]): void
   (e: 'taskFailed', task: TighteningTask): void
   (e: 'allTasksComplete'): void
+  (e: 'request-manual-auth'): void
 }>()
 
-// ==================== 状态管理 ====================
 const isSignalRConnected = ref(false)
-const isConnected = ref(false) // 对应控制器连接状态
+const isConnected = ref(false)
+const lastControllerStatus = ref('')
 const currentPSet = ref<string>('-')
 const currentTorque = ref<string>('0.000')
 const currentAngle = ref<string>('0.0')
@@ -31,63 +41,111 @@ const isToolEnabled = ref(false)
 const isDataSubscribed = ref(false)
 
 const targetPSet = ref('001')
-let connection: any = null
 const isPreparingTask = ref(false)
 const armedTaskId = ref<string | null>(null)
-
-// 流程中止标志：只有用户点复位时才真正停止等待
 const workflowAborted = ref(false)
 
+const backendBaseUrl = 'http://127.0.0.1:5246'
+
+let connection: any = null
+
+const localLogs = ref<LocalLog[]>([])
+const heartbeatLogs = ref<LocalLog[]>([])
+
+interface CommandAckResult {
+  rxMid: string
+  targetMid: string
+  raw: string
+  errorCode?: string
+}
+
+interface CommandWaiter {
+  targetMid: string
+  expectedRxMids: Set<string>
+  resolve: (result: CommandAckResult) => void
+  reject: (reason?: unknown) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+const commandWaiters = new Map<string, CommandWaiter>()
+
 onMounted(() => {
-  initSignalR()
+  void initSignalR()
 })
 
 onUnmounted(() => {
-  if (connection) connection.stop()
+  for (const [mid, waiter] of commandWaiters.entries()) {
+    clearTimeout(waiter.timer)
+    waiter.reject(new Error(`MID ${mid} waiter canceled`))
+  }
+  commandWaiters.clear()
+  if (connection) {
+    void connection.stop()
+  }
 })
+
+watch(
+  () => [props.ip, props.port] as const,
+  async () => {
+    if (!isSignalRConnected.value) return
+    try {
+      await syncControllerConfig(false)
+      logLocal('info', `[System] Controller endpoint updated: ${props.ip}:${props.port}`)
+    } catch (err: any) {
+      logLocal('warn', `[System] Controller endpoint sync failed: ${err?.message || err}`)
+    }
+  }
+)
+
+function normalizeLevel(raw: unknown): UiLogLevel {
+  if (raw === 'success' || raw === 'warn' || raw === 'error') return raw
+  return 'info'
+}
 
 async function initSignalR() {
   connection = new HubConnectionBuilder()
-    .withUrl('/api/torqueHub') 
+    .withUrl('/api/torqueHub')
     .withAutomaticReconnect()
     .configureLogging(LogLevel.Information)
     .build()
 
   connection.on('ReceiveLog', (entry: any) => {
-    if (entry.level === 'success' && (entry.msg.includes('[RX]') || entry.msg.includes('TCP 链路已连通'))) {
-       statusText.value = '通信已建立 (已连接)'
-       isConnected.value = true
-       if (props.tasks.some(t => t.result === 'PENDING')) {
-         void executeNextPendingTask()
-       }
-    }
+    const msg = String(entry?.msg || '')
+    const level = normalizeLevel(entry?.level)
 
-
-    if (entry.isHeartbeat) {
-      logHeartbeat(entry.level, entry.msg)
+    if (entry?.isHeartbeat) {
+      const heartbeatLevel: 'info' | 'success' = level === 'success' ? 'success' : 'info'
+      logHeartbeat(heartbeatLevel, msg)
       isHeartbeatActive.value = false
-      setTimeout(() => isHeartbeatActive.value = true, 100)
-    } else {
-      logLocal(entry.level, entry.msg)
+      setTimeout(() => {
+        isHeartbeatActive.value = true
+      }, 100)
+      return
     }
+
+    if (msg.startsWith('[RX] ')) {
+      const rawPayload = msg.slice(5)
+      handleRxPayloadForAck(rawPayload)
+    }
+
+    logLocal(level, msg)
   })
 
-  // 后端通知：SignalR 刚建立时，TCP 已连接 → 前端立即亮绿灯，并订阅拧紧数据
-  connection.on('ControllerConnected', async () => {
-    isConnected.value = true
-    statusText.value = 'TCP 已连接，等待工步下发...'
-    logLocal('success', '[System] ✅ 控制器 TCP 连接状态已同步')
-    void executeNextPendingTask()
+  connection.on('ControllerConnected', () => {
+    logLocal('info', '[System] 收到控制器连接事件，等待状态确认...')
   })
 
-  // 【核心交互】：处理拧紧结果并自动填入任务矩阵
-  connection.on('ReceiveStatus', (status: string) => {
-    if (status.includes('物理成功连上控制器') || status.includes('已连接')) {
+  connection.on('ReceiveStatus', (statusRaw: string) => {
+    const status = String(statusRaw || '').trim()
+    if (!status || status === lastControllerStatus.value) return
+    lastControllerStatus.value = status
+
+    if (status.includes('已连接') || status.includes('成功')) {
       isConnected.value = true
       if (props.tasks.some(t => t.result === 'PENDING')) {
         void executeNextPendingTask()
       }
-    } else if (status.includes('连接断开') || status.includes('未连接')) {
+    } else if (status.includes('断开') || status.includes('未连接')) {
       isConnected.value = false
       isPSetSet.value = false
       isToolEnabled.value = false
@@ -99,160 +157,353 @@ async function initSignalR() {
 
   connection.on('ReceiveData', (data: any) => {
     armedTaskId.value = null
-    currentTorque.value = data.torque
-    currentAngle.value = data.angle
-    statusText.value = `收到拧紧结果: ${data.status}`
 
-    // 复制一份任务列表进行更新
+    const torque = String(data?.torque ?? '0.000')
+    const angle = String(data?.angle ?? '0.0')
+    const status = String(data?.status ?? 'NOK')
+
+    currentTorque.value = torque
+    currentAngle.value = angle
+    statusText.value = `收到拧紧结果: ${status}`
+
     const updatedTasks = JSON.parse(JSON.stringify(props.tasks)) as TighteningTask[]
-    
-    // 逻辑：寻找当前所有任务中，第一个结果为 PENDING 的任务
     const nextIdx = updatedTasks.findIndex(t => t.result === 'PENDING')
-    if (nextIdx !== -1) {
-      const task = updatedTasks[nextIdx]
-      const now = new Date()
-      const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
-      
-      // 直接根据控制器返回的 status 判定结果，不再根据上下限判定
-      const isPass = (data.status === 'OK')
-
-      // 保存到历史记录
-      task.history.push({
-        torque: data.torque,
-        angle: data.angle,
-        result: isPass ? 'PASS' : 'FAIL',
-        timestamp: timestamp
-      })
-
-      // 更新主字段
-      task.actualTorque = data.torque
-      task.actualAngle = data.angle
-      task.timestamp = timestamp
-      task.result = isPass ? 'PASS' : 'FAIL'
-
-      // 发射更新
+    if (nextIdx === -1) {
       emit('update:tasks', updatedTasks)
-      logLocal(isPass ? 'success' : 'error', `[数据] ${task.itemDisplayName}: ${data.torque}Nm / ${data.angle}Deg [${isPass ? 'PASS' : 'FAIL'}]`)
-
-      // 触发后续自动化流程
-      handleTaskResult(task)
-    } else {
-      emit('update:tasks', updatedTasks)
+      return
     }
+
+    const task = updatedTasks[nextIdx]
+    const now = new Date()
+    const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
+    const isPass = status === 'OK'
+
+    task.history.push({
+      torque,
+      angle,
+      result: isPass ? 'PASS' : 'FAIL',
+      timestamp
+    })
+
+    task.actualTorque = torque
+    task.actualAngle = angle
+    task.timestamp = timestamp
+    task.result = isPass ? 'PASS' : 'FAIL'
+
+    emit('update:tasks', updatedTasks)
+    logLocal(isPass ? 'success' : 'error', `[Data] ${task.itemDisplayName}: ${torque}Nm / ${angle}Deg [${isPass ? 'PASS' : 'FAIL'}]`)
+    void handleTaskResult(task)
   })
 
   try {
     await connection.start()
-    isSignalRConnected.value = true 
-    logLocal('success', '[System] 已连接到 C# 实时通讯服务')
-    
-    // 启动后尝试查询一次后端状态（可选，但目前我们依赖后端推送）
-  } catch (err: any) {
+    isSignalRConnected.value = true
+    logLocal('success', '[System] SignalR connected to backend')
+  } catch {
     isConnected.value = false
-    logLocal('error', '[System] 无法连接到 C# 服务')
+    logLocal('error', '[System] SignalR connection failed')
   }
 }
 
-async function sendCommandToBackend(mid: string, pset: string = "") {
-  try {
-    await fetch(`http://127.0.0.1:5246/command?mid=${mid}&pset=${pset}`, { 
-      method: 'POST' 
+async function sendCommandToBackend(mid: string, pset = '') {
+  const response = await fetch(`${backendBaseUrl}/command?mid=${mid}&pset=${pset}`, {
+    method: 'POST'
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(text || `HTTP ${response.status}`)
+  }
+}
+
+async function syncControllerConfig(reconnect: boolean) {
+  const response = await fetch(`${backendBaseUrl}/controller/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ip: props.ip,
+      port: props.port,
+      reconnect
     })
-  } catch (err) {
+  })
 
-    logLocal('error', '[System] 指令下发失败，请求后端 API 异常')
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(text || `HTTP ${response.status}`)
   }
 }
 
-interface LocalLog {
-  time: string
-  level: string
-  msg: string
+function clearCommandWaiter(targetMid: string) {
+  const waiter = commandWaiters.get(targetMid)
+  if (!waiter) return
+  clearTimeout(waiter.timer)
+  commandWaiters.delete(targetMid)
 }
-const localLogs = ref<LocalLog[]>([])
-const heartbeatLogs = ref<LocalLog[]>([])
 
-function stringToHex(str: string): string {
-  const parts: string[] = []
-  const cleanStr = str.replace(/\\0/g, '\0')
-  for (let i = 0; i < cleanStr.length; i++) {
-    parts.push(cleanStr.charCodeAt(i).toString(16).toUpperCase().padStart(2, '0'))
+function resolveCommandWaiter(targetMid: string, result: CommandAckResult) {
+  const waiter = commandWaiters.get(targetMid)
+  if (!waiter) return
+  if (!waiter.expectedRxMids.has(result.rxMid)) return
+  clearTimeout(waiter.timer)
+  commandWaiters.delete(targetMid)
+  waiter.resolve(result)
+}
+
+function rejectCommandWaiter(targetMid: string, error: Error) {
+  const waiter = commandWaiters.get(targetMid)
+  if (!waiter) return
+  clearTimeout(waiter.timer)
+  commandWaiters.delete(targetMid)
+  waiter.reject(error)
+}
+
+function waitForCommandAck(targetMid: string, expectedRxMids: string[], timeoutMs = 3000): Promise<CommandAckResult> {
+  clearCommandWaiter(targetMid)
+  return new Promise<CommandAckResult>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      commandWaiters.delete(targetMid)
+      reject(new Error(`MID ${targetMid} ack timeout (${timeoutMs}ms)`))
+    }, timeoutMs)
+    commandWaiters.set(targetMid, {
+      targetMid,
+      expectedRxMids: new Set(expectedRxMids),
+      resolve,
+      reject,
+      timer
+    })
+  })
+}
+
+async function sendCommandAndWaitAck(options: {
+  mid: string
+  pset?: string
+  targetMid?: string
+  expectedRxMids: string[]
+  timeoutMs?: number
+}) {
+  const targetMid = options.targetMid || options.mid
+  const ackPromise = waitForCommandAck(targetMid, options.expectedRxMids, options.timeoutMs ?? 3000)
+  await sendCommandToBackend(options.mid, options.pset || '')
+  return ackPromise
+}
+
+function handleRxPayloadForAck(rawPayload: string) {
+  const payload = normalizePayloadToAscii(rawPayload)
+  if (!payload || payload.length < 8) return
+
+  const rxMid = payload.slice(4, 8)
+  if (rxMid === '0005' && payload.length >= 24) {
+    const ackMid = payload.slice(20, 24).trim()
+    if (!ackMid) return
+    resolveCommandWaiter(ackMid, { rxMid, targetMid: ackMid, raw: payload })
+    return
   }
-  return parts.join(' ')
+
+  if (rxMid === '0004' && payload.length >= 26) {
+    const failedMid = payload.slice(20, 24).trim()
+    const errorCode = payload.slice(24, 26).trim()
+    if (!failedMid) return
+
+    // 0060 + 09 在该控制器上常见，表示已订阅/可忽略，按成功处理
+    if (failedMid === '0060' && errorCode === '09') {
+      resolveCommandWaiter('0060', { rxMid, targetMid: '0060', raw: payload, errorCode })
+      return
+    }
+
+    rejectCommandWaiter(failedMid, new Error(`MID ${failedMid} rejected, code ${errorCode || '??'}`))
+    return
+  }
+
+  if (rxMid === '0019') {
+    resolveCommandWaiter('0018', { rxMid, targetMid: '0018', raw: payload })
+    return
+  }
+
+  if (rxMid === '0044') {
+    resolveCommandWaiter('0043', { rxMid, targetMid: '0043', raw: payload })
+  }
 }
 
-function logLocal(level: 'info'|'success'|'warn'|'error', msg: string) {
+function getMidDescription(mid: string): string {
+  const table: Record<string, string> = {
+    '0001': '通信启动',
+    '0002': '通信启动应答',
+    '0004': '命令错误',
+    '0005': '命令接受',
+    '0018': 'PSet 选择',
+    '0019': 'PSet 选择应答',
+    '0042': '工具锁定',
+    '0043': '工具使能',
+    '0044': '工具使能应答',
+    '0060': '结果订阅',
+    '0061': '结果数据',
+    '0062': '结果确认',
+    '9999': '心跳保活'
+  }
+  return table[mid] || '未知MID'
+}
+
+function normalizePayloadToAscii(payload: string): string {
+  const trimmed = payload.trim()
+  if (!trimmed) return payload
+
+  const isHexBytes = /^(?:[0-9A-Fa-f]{2}(?:\s+|$))+$/.test(trimmed)
+  if (!isHexBytes) return payload
+
+  try {
+    return trimmed
+      .split(/\s+/)
+      .map(part => String.fromCharCode(parseInt(part, 16)))
+      .join('')
+  } catch {
+    return payload
+  }
+}
+
+function formatTxRxMessage(msg: string): string {
+  const isTxOrRx = msg.startsWith('[TX] ') || msg.startsWith('[RX] ')
+  if (!isTxOrRx) return msg
+
+  const prefix = msg.slice(0, 5)
+  const payload = normalizePayloadToAscii(msg.slice(5))
+  const ascii = payload.replace(/\0/g, '\\0').replace(/ /g, '·')
+
+  const mid = payload.length >= 8 ? payload.slice(4, 8) : '----'
+  let parsed = `MID ${mid} (${getMidDescription(mid)})`
+
+  // MID 0005 报文的 20~23 位通常是被确认的命令 MID
+  if (mid === '0005' && payload.length >= 24) {
+    const ackMid = payload.slice(20, 24)
+    parsed += ` -> ACK ${ackMid} (${getMidDescription(ackMid)})`
+  }
+
+  return `${prefix}ASCII:${ascii} | ${parsed}`
+}
+
+function logLocal(level: UiLogLevel, msg: string) {
   const time = new Date().toLocaleTimeString()
-  let displayMsg = msg
-  if (msg.startsWith('[TX] ') || msg.startsWith('[RX] ')) {
-    const prefix = msg.slice(0, 5)
-    const content = msg.slice(5)
-    displayMsg = `${prefix}${stringToHex(content)}`
-  }
+  const displayMsg = formatTxRxMessage(msg)
+
   localLogs.value.unshift({ time, level, msg: displayMsg })
   if (localLogs.value.length > 50) localLogs.value.pop()
 }
 
-function logHeartbeat(level: 'info'|'success', msg: string) {
+function logHeartbeat(level: 'info' | 'success', msg: string) {
   const time = new Date().toLocaleTimeString()
-  let displayMsg = msg
-  if (msg.startsWith('[TX] ') || msg.startsWith('[RX] ')) {
-    const prefix = msg.slice(0, 5)
-    const content = msg.slice(5)
-    displayMsg = `${prefix}${stringToHex(content)}`
-  }
+  const displayMsg = formatTxRxMessage(msg)
+
   heartbeatLogs.value.unshift({ time, level, msg: displayMsg })
   if (heartbeatLogs.value.length > 20) heartbeatLogs.value.pop()
 }
 
-async function handleConnect() {
-  logLocal('info', `[System] 请求后端建立 TCP 连接...`)
-  try {
-    await fetch('http://127.0.0.1:5246/reconnect', { method: 'POST' })
-    logLocal('info', '[System] 已通知后端发起 MID 0001 握手')
-    if (props.tasks.some(t => t.result === 'PENDING')) {
-      void executeNextPendingTask()
-    }
-  } catch (err) {
-
-    logLocal('error', '[System] 通知后端失败，请确认后端服务已启动')
+function requestManualAuthPrompt(logMessage = true) {
+  emit('request-manual-auth')
+  if (logMessage) {
+    logLocal('warn', '[权限] 快捷指令已禁用，请先管理员登录授权')
   }
 }
 
-function handleDisconnect() {
-  // 断开业务逻辑
+function ensureManualCommandAuthorized(): boolean {
+  if (props.manualCommandAuthorized) return true
+  requestManualAuthPrompt()
+  return false
+}
+
+async function handleConnect() {
+  logLocal('info', '[System] Request backend to connect controller...')
+  try {
+    workflowAborted.value = false
+    await syncControllerConfig(true)
+    logLocal('info', `[System] Reconnect requested: ${props.ip}:${props.port}`)
+    if (props.tasks.some(t => t.result === 'PENDING')) {
+      void executeNextPendingTask()
+    }
+  } catch {
+    logLocal('error', '[System] Failed to notify backend for reconnect')
+  }
+}
+
+async function handleDisconnect() {
+  logLocal('info', '[System] Request backend to disconnect controller...')
+  try {
+    await fetch(`${backendBaseUrl}/disconnect`, { method: 'POST' })
+    isConnected.value = false
+    isPSetSet.value = false
+    isToolEnabled.value = false
+    isDataSubscribed.value = false
+    armedTaskId.value = null
+    statusText.value = '连接已断开'
+    workflowStatus.value = '等待流程开启...'
+    logLocal('warn', '[System] Controller disconnected')
+  } catch {
+    logLocal('error', '[System] Disconnect request failed')
+  }
 }
 
 async function sendPSet() {
+  if (!ensureManualCommandAuthorized()) return
   const psetVal = targetPSet.value.toString().padStart(3, '0')
-  await sendCommandToBackend('0018', psetVal)
-  statusText.value = `正在下载 PSet ${psetVal}...`
-  isPSetSet.value = true
+  try {
+    statusText.value = `正在下载 PSet ${psetVal}...`
+    await sendCommandAndWaitAck({
+      mid: '0018',
+      pset: psetVal,
+      targetMid: '0018',
+      expectedRxMids: ['0005', '0019'],
+      timeoutMs: 3500
+    })
+    isPSetSet.value = true
+    logLocal('success', `[System] PSet ${psetVal} 已确认`)
+  } catch (err: any) {
+    isPSetSet.value = false
+    statusText.value = `PSet 下发失败: ${err?.message || err}`
+    logLocal('error', `[System] PSet 设置失败: ${err?.message || err}`)
+  }
 }
 
 async function enableTool() {
-  await sendCommandToBackend('0043')
-  statusText.value = `正在解锁工具...`
-  isToolEnabled.value = true
+  if (!ensureManualCommandAuthorized()) return
+  try {
+    statusText.value = '正在使能工具...'
+    await sendCommandAndWaitAck({
+      mid: '0043',
+      targetMid: '0043',
+      expectedRxMids: ['0005', '0044'],
+      timeoutMs: 3500
+    })
+    isToolEnabled.value = true
+    logLocal('success', '[System] 工具使能已确认')
+  } catch (err: any) {
+    isToolEnabled.value = false
+    statusText.value = `工具使能失败: ${err?.message || err}`
+    logLocal('error', `[System] 工具使能失败: ${err?.message || err}`)
+  }
 }
 
 async function lockTool() {
-  await sendCommandToBackend('0042')
-  statusText.value = `正在强制锁定工具...`
-  isToolEnabled.value = false
+  if (!ensureManualCommandAuthorized()) return
+  try {
+    statusText.value = '正在锁定工具...'
+    await sendCommandAndWaitAck({
+      mid: '0042',
+      targetMid: '0042',
+      expectedRxMids: ['0005'],
+      timeoutMs: 3000
+    })
+    isToolEnabled.value = false
+    logLocal('success', '[System] 工具锁定已确认')
+  } catch (err: any) {
+    statusText.value = `工具锁定失败: ${err?.message || err}`
+    logLocal('error', `[System] 工具锁定失败: ${err?.message || err}`)
+  }
 }
-
-
-// =============== 自动化流程方法 ===============
 
 async function executeNextPendingTask() {
   if (isPreparingTask.value) return
 
-  // 【等待连接】：TCP 未连接时轮询等待，而非中止流程
   if (!isConnected.value) {
-    logLocal('warn', '[流程] ⏳ 控制器未连接，等待连接中...')
-    statusText.value = '⏳ 等待控制器连接中...'
-    // 每500ms检查一次，直到连上或流程被复位
+    logLocal('warn', '[Flow] Controller is not connected, waiting...')
+    statusText.value = '等待控制器连接中...'
+
     await new Promise<void>((resolve) => {
       const timer = setInterval(() => {
         if (workflowAborted.value || isConnected.value) {
@@ -261,85 +512,118 @@ async function executeNextPendingTask() {
         }
       }, 500)
     })
+
     if (workflowAborted.value) {
-      logLocal('info', '[流程] 流程已被复位，停止等待。')
+      logLocal('info', '[Flow] Workflow aborted while waiting for connection')
       return
     }
-    logLocal('success', '[流程] ✅ 控制器已连接，继续执行！')
+
+    logLocal('success', '[Flow] Controller connected, continue workflow')
   }
 
   const nextIdx = props.tasks.findIndex(t => t.result === 'PENDING')
   if (nextIdx === -1) {
-    workflowStatus.value = '✅ 当前所有螺丝定扭任务已完成！'
-    logLocal('success', '所有定扭任务已完成')
+    workflowStatus.value = '当前所有螺丝定扭任务已完成'
+    logLocal('success', 'All tightening tasks completed')
     emit('allTasksComplete')
     return
   }
-  
+
   const task = props.tasks[nextIdx]
   if (armedTaskId.value === task.id) {
     statusText.value = `就绪，等待拧紧结果... (PSet ${currentPSet.value})`
-    workflowStatus.value = `正在等待控制器上报: ${task.itemDisplayName} (${task.workstepName})`
+    workflowStatus.value = `等待上报: ${task.itemDisplayName} (${task.workstepName})`
     return
   }
 
   currentPSet.value = task.pSetNo
-  workflowStatus.value = `正在进行: ${task.itemDisplayName} (${task.workstepName})`
-  
+  workflowStatus.value = `正在执行: ${task.itemDisplayName} (${task.workstepName})`
+
   const psetVal = task.pSetNo.padStart(3, '0')
-  
+
   isPreparingTask.value = true
   try {
-    logLocal('info', `[流程] 准备执行螺丝: ${task.itemDisplayName}, PSet: ${psetVal}`)
+    logLocal('info', `[Flow] Prepare task ${task.itemDisplayName}, PSet ${psetVal}`)
     targetPSet.value = psetVal
-    await sendCommandToBackend('0018', psetVal)
+
+    await sendCommandAndWaitAck({
+      mid: '0018',
+      pset: psetVal,
+      targetMid: '0018',
+      expectedRxMids: ['0005', '0019'],
+      timeoutMs: 3500
+    })
     isPSetSet.value = true
-    statusText.value = `已下发 PSet ${psetVal}`
-    
+    statusText.value = `PSet 下发完成: ${psetVal}`
+
     await new Promise(r => setTimeout(r, 200))
-    
-    await sendCommandToBackend('0043')
+
+    await sendCommandAndWaitAck({
+      mid: '0043',
+      targetMid: '0043',
+      expectedRxMids: ['0005', '0044'],
+      timeoutMs: 3500
+    })
     isToolEnabled.value = true
-    statusText.value = `工具已使能，正在订阅数据...`
-    
+    statusText.value = '工具已使能，准备订阅数据...'
+
     if (!isDataSubscribed.value) {
-      await sendCommandToBackend('0060')
+      await sendCommandAndWaitAck({
+        mid: '0060',
+        targetMid: '0060',
+        expectedRxMids: ['0005', '0004'],
+        timeoutMs: 3000
+      })
       isDataSubscribed.value = true
     }
+
     armedTaskId.value = task.id
-    workflowStatus.value = `正在等待控制器上报: ${task.itemDisplayName} (${task.workstepName})`
+    workflowStatus.value = `等待上报: ${task.itemDisplayName} (${task.workstepName})`
     statusText.value = `就绪，等待拧紧结果... (PSet ${psetVal})`
+  } catch (err: any) {
+    armedTaskId.value = null
+    isToolEnabled.value = false
+    const msg = err?.message || String(err)
+    workflowStatus.value = `命令链失败: ${task.itemDisplayName}`
+    statusText.value = `等待人工处理: ${msg}`
+    logLocal('error', `[Flow] Command chain failed (${task.itemDisplayName}): ${msg}`)
   } finally {
     isPreparingTask.value = false
   }
 }
 
 async function handleTaskResult(task: TighteningTask) {
-  // 1. 打完立刻下发 0042 锁定工具 (Disable Tool)，防止误连打
-  await sendCommandToBackend('0042')
-  isToolEnabled.value = false
-  statusText.value = `工具已锁定`
-  logLocal('info', `[流程] 收到结果，立刻下发 0042 锁定工具`)
-  
-  if (task.result === 'FAIL') {
-    // 2. 失败情况：保持锁定，等待人工确认
-    logLocal('warn', `[流程] 拧紧失败，工具保持锁定，等待人工干预...`)
-    emit('taskFailed', task)
-  } else {
-    // 3. 成功情况：等待 2s 后切换下一颗并解锁
-    logLocal('info', `[流程] 拧紧成功，等待 2s 后继续...`)
-    await new Promise(r => setTimeout(r, 2000))
-    executeNextPendingTask()
+  try {
+    await sendCommandAndWaitAck({
+      mid: '0042',
+      targetMid: '0042',
+      expectedRxMids: ['0005'],
+      timeoutMs: 3000
+    })
+    isToolEnabled.value = false
+    statusText.value = '工具已锁定'
+    logLocal('info', '[Flow] Result received, lock tool immediately (MID 0042)')
+  } catch (err: any) {
+    const msg = err?.message || String(err)
+    logLocal('error', `[Flow] Lock tool failed: ${msg}`)
   }
+
+  if (task.result === 'FAIL') {
+    logLocal('warn', '[Flow] Tightening failed, waiting for manual handling')
+    emit('taskFailed', task)
+    return
+  }
+
+  logLocal('info', '[Flow] Tightening passed, continue after 2s')
+  await new Promise(r => setTimeout(r, 2000))
+  void executeNextPendingTask()
 }
 
-
-// 暴露方法给外部调用（如 MaterialScanner 验证完毕后启动，或人工确认失败后继续）
 defineExpose({
   executeNextPendingTask,
   abortWorkflow: () => {
     workflowAborted.value = true
-    logLocal('info', '[流程] 用户已复位，流程终止。')
+    logLocal('info', '[Flow] Workflow aborted by reset action')
     statusText.value = '已复位，等待下一件'
     workflowStatus.value = '等待流程开启...'
     currentPSet.value = '-'
@@ -350,9 +634,9 @@ defineExpose({
     isDataSubscribed.value = false
   },
   resumeTighteningWorkflow: async () => {
-    logLocal('info', `[流程] 人工确认完毕，等待 2s 后继续...`)
+    logLocal('info', '[Flow] Manual confirmation done, continue after 2s')
     await new Promise(r => setTimeout(r, 2000))
-    executeNextPendingTask()
+    void executeNextPendingTask()
   },
   resetWorkflow: () => {
     workflowAborted.value = false
@@ -362,9 +646,7 @@ defineExpose({
     isToolEnabled.value = false
     isDataSubscribed.value = false
   }
-
 })
-
 </script>
 
 <template>
@@ -373,12 +655,16 @@ defineExpose({
       <span class="icon">🔧</span> 定扭控制器对接 (Desoutter Open Protocol)
     </div>
 
-    <!-- 顶栏连接状态区域 -->
+    <!-- 顶部连接状态 -->
     <div class="status-bar" :class="{ connected: isConnected }">
       <div class="conn-info">
         <div class="ip-row">
           <span class="label">目标控制器：</span>
           <span class="mono ip-text">{{ ip }}:{{ port }}</span>
+          <span class="heartbeat-pill" :class="{ on: isHeartbeatActive }">
+            <span class="heartbeat-led"></span>
+            心跳
+          </span>
         </div>
         <div class="status-row">
           <div class="indicator" :class="{ 'on': isConnected }"></div>
@@ -386,12 +672,12 @@ defineExpose({
         </div>
       </div>
       <div class="actions">
-        <button v-if="!isConnected" class="btn connect" @click="handleConnect" :disabled="!isSignalRConnected">🔗 连接接口 (MID 0001)</button>
-        <button v-else class="btn disconnect" @click="handleDisconnect">🔌 断开连接 (MID 0003)</button>
+        <button v-if="!isConnected" class="btn connect" @click="handleConnect" :disabled="!isSignalRConnected">🔌 连接控制器 (MID 0001)</button>
+        <button v-else class="btn disconnect" @click="handleDisconnect">🔒 断开连接 (MID 0003)</button>
       </div>
     </div>
     
-    <!-- 自动化流程状态栏 -->
+    <!-- 自动流程状态栏 -->
     <div class="workflow-bar" v-if="isConnected">
       <div class="wf-content">
         <span class="wf-icon">🚀</span>
@@ -400,22 +686,6 @@ defineExpose({
     </div>
 
     <div class="dashboard" :class="{ 'dimmed': !isConnected }">
-      <!-- 状态指示灯 -->
-      <div class="state-flags">
-        <div class="flag" :class="{ on: isHeartbeatActive }">
-          <div class="flag-led"></div>心跳信号(MID 9999)
-        </div>
-        <div class="flag" :class="{ on: isPSetSet }">
-          <div class="flag-led"></div>程序设定(MID 0019)
-        </div>
-        <div class="flag" :class="{ on: isToolEnabled }">
-          <div class="flag-led"></div>枪体使能(MID 0044)
-        </div>
-        <div class="flag" :class="{ on: isDataSubscribed }">
-          <div class="flag-led"></div>实时数据(MID 0060)
-        </div>
-      </div>
-
       <!-- 实时数据看板 -->
       <div class="dashboard-metrics">
         <div class="metric-card">
@@ -434,20 +704,37 @@ defineExpose({
 
       <!-- 操作面板 -->
       <div class="controls-panel">
-        <h3 class="panel-title">快捷指令下发及测试</h3>
+        <h3 class="panel-title">快捷指令下发与测试</h3>
         <div class="cmd-buttons">
-          <div class="pset-input-wrap">
-            <span class="pset-label">PSet编号:</span>
-            <input type="text" v-model="targetPSet" class="pset-input mono" placeholder="001" maxlength="3">
+          <div class="auth-inline">
+            <button
+              v-if="!props.manualCommandAuthorized"
+              class="btn auth-combo"
+              @click="requestManualAuthPrompt(false)"
+            >
+              快捷下发已禁用，点击管理员登录授权
+            </button>
+            <span v-else class="auth-tag authorized">管理员已授权，可手动下发</span>
           </div>
-          <button class="btn cmd" @click="sendPSet" :disabled="!isConnected">
-            📥 PSet 设置 (MID 0018)
+          <div class="pset-input-wrap">
+            <span class="pset-label">PSet 编号:</span>
+            <input
+              type="text"
+              v-model="targetPSet"
+              class="pset-input mono"
+              placeholder="001"
+              maxlength="3"
+              :disabled="!isConnected || !props.manualCommandAuthorized"
+            >
+          </div>
+          <button class="btn cmd" @click="sendPSet" :disabled="!isConnected || !props.manualCommandAuthorized">
+            📜 PSet 设置 (MID 0018)
           </button>
-          <button class="btn cmd primary" @click="enableTool" :disabled="!isConnected">
-            🔓 枪体使能 (MID 0043)
+          <button class="btn cmd primary" @click="enableTool" :disabled="!isConnected || !props.manualCommandAuthorized">
+            🔓 工具使能 (MID 0043)
           </button>
-          <button class="btn cmd lock" @click="lockTool" :disabled="!isConnected">
-            🔒 锁定工具 (MID 0042)
+          <button class="btn cmd lock" @click="lockTool" :disabled="!isConnected || !props.manualCommandAuthorized">
+            🔒 工具锁定 (MID 0042)
           </button>
         </div>
 
@@ -475,10 +762,10 @@ defineExpose({
             </div>
           </div>
 
-          <!-- 心跳专用独立日志 -->
+          <!-- 心跳专用日志 -->
           <div class="terminal-panel heartbeat-panel">
             <div class="terminal-header">
-              <span>心跳专属保活日志 (Keep-Alive)</span>
+              <span>心跳保活日志 (Keep-Alive)</span>
             </div>
             <div class="terminal-content">
               <div 
@@ -542,12 +829,48 @@ defineExpose({
 }
 
 .ip-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   font-size: 13px;
   color: #cfd8dc;
 }
 .ip-text {
   color: #64b5f6;
   font-weight: bold;
+}
+
+.heartbeat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(100, 181, 246, 0.25);
+  background: rgba(100, 181, 246, 0.08);
+  color: #90caf9;
+  font-size: 12px;
+}
+
+.heartbeat-led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #37474f;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5);
+  transition: all 0.3s;
+}
+
+.heartbeat-pill.on {
+  color: #69f0ae;
+  border-color: rgba(0, 230, 118, 0.35);
+  background: rgba(0, 230, 118, 0.08);
+}
+
+.heartbeat-pill.on .heartbeat-led {
+  background: #00e676;
+  box-shadow: 0 0 8px rgba(0, 230, 118, 0.45);
 }
 
 .status-row {
@@ -687,17 +1010,63 @@ defineExpose({
 }
 
 .panel-title {
-  margin: 0 0 16px 0;
+  margin: 0 0 12px 0;
   font-size: 14px;
   color: #b0bec5;
 }
 
+.auth-tag {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 152, 0, 0.35);
+  background: rgba(255, 152, 0, 0.1);
+  color: #ffb74d;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.auth-tag.authorized {
+  border-color: rgba(0, 230, 118, 0.35);
+  background: rgba(0, 230, 118, 0.08);
+  color: #69f0ae;
+}
+
+.auth-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.btn.auth-combo {
+  background: rgba(255, 152, 0, 0.12);
+  color: #ffb74d;
+  border: 1px dashed rgba(255, 183, 77, 0.45);
+  white-space: nowrap;
+}
+
+.btn.auth-combo:hover {
+  background: rgba(255, 152, 0, 0.2);
+}
+
 .cmd-buttons {
   display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
+  flex-wrap: nowrap;
+  gap: 12px;
   margin-bottom: 24px;
   align-items: center;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.cmd-buttons::-webkit-scrollbar {
+  height: 6px;
+}
+
+.cmd-buttons::-webkit-scrollbar-thumb {
+  background: rgba(100, 181, 246, 0.25);
+  border-radius: 4px;
 }
 
 .pset-input-wrap {
@@ -709,6 +1078,7 @@ defineExpose({
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+  flex: 0 0 auto;
 }
 .pset-label {
   font-size: 13px;
@@ -732,10 +1102,17 @@ defineExpose({
   background: rgba(0, 230, 118, 0.05);
 }
 
+.pset-input:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .btn.cmd {
   background: rgba(142, 36, 170, 0.15);
   color: #ce93d8;
   border: 1px solid rgba(142, 36, 170, 0.3);
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .btn.cmd.lock {
@@ -761,43 +1138,6 @@ defineExpose({
 }
 .btn.cmd.outline:hover {
   background: rgba(66, 165, 245, 0.1);
-}
-
-.state-flags {
-  display: flex;
-  justify-content: space-between;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  padding: 16px;
-  border-radius: 8px;
-}
-
-.flag {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #78909c;
-  transition: color 0.3s;
-}
-
-.flag-led {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #37474f;
-  box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
-  transition: all 0.3s;
-}
-
-.flag.on {
-  color: #e0e6ed;
-  font-weight: 600;
-}
-
-.flag.on .flag-led {
-  background: #00e676;
-  box-shadow: 0 0 10px rgba(0, 230, 118, 0.5), inset 0 1px 2px rgba(255,255,255,0.5);
 }
 
 .info-note {
@@ -906,3 +1246,4 @@ defineExpose({
 
 .mono { font-family: 'Consolas', monospace; }
 </style>
+

@@ -1,5 +1,5 @@
-<script setup lang="ts">
-import { ref, reactive, onMounted, nextTick } from 'vue'
+﻿<script setup lang="ts">
+import { ref, reactive, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import type { AppConfig, CompleteCheckInputRequest, OrderInfo, RouteStep, TestResult, WorkStep, TighteningTask } from './types/mes'
 import { getOrderByProcess, getRouteList, completeCheckInput, pushPackMessageToMes } from './services/mesApi'
 import ConfigModal from './components/ConfigModal.vue'
@@ -10,40 +10,62 @@ import MaterialScanner from './components/MaterialScanner.vue'
 import TorqueInteraction from './components/TorqueInteraction.vue'
 import LoginModal from './components/LoginModal.vue'
 import type { User } from './types/mes'
+import { clearSignal, writeSignal } from './utils/labviewSignal'
+import { pullBarcodeScannerEvents, startBarcodeScanner, stopBarcodeScanner } from './services/barcodeScannerApi'
+import { getAppConfig, saveAppConfig } from './services/appConfigApi'
 
-const CONFIG_KEY = 'mes_app_config_v2'
 const DEFAULT_CONFIG: AppConfig = {
   orderApiUrl: '/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess',
   routeApiUrl: '/mes-api/api/OrderInfo/GetTechRouteListByCode',
+  singleMaterialApiUrl: '/mes-api/api/ProduceMessage/SingleCheckInput',
+  fullMaterialApiUrl: '/mes-api/api/ProduceMessage/CompleteCheckInput',
+  mesUploadApiUrl: '/mes-push/api/ProduceMessage/PushPackMessageToMes',
   technicsProcessCode: 'CTP_P1240',
+  technicsProcessName: '默认工序',
+  userName: 'admin',
+  userAccount: 'admin',
+  deviceCode: '',
+  deviceName: '',
   desoutterIp: '192.168.5.212',
   desoutterPort: 4545,
+  scannerIp: '',
+  scannerPort: 0,
+  barcodeRegex: '.*',
 
   logSavePath: 'C:\\NJ_Torque_Logs',
   adminUsername: 'admin',
   adminPassword: '123'
 }
 
-
-
-function loadConfig(): AppConfig {
-  try {
-    const raw = localStorage.getItem(CONFIG_KEY)
-    if (raw) return { ...DEFAULT_CONFIG, ...JSON.parse(raw) }
-  } catch {}
-  return { ...DEFAULT_CONFIG }
-}
-
-const config = reactive<AppConfig>(loadConfig())
+const config = reactive<AppConfig>({ ...DEFAULT_CONFIG })
 const showConfig = ref(false)
 const showLogin = ref(false)
 const currentUser = ref<User | null>(null)
-const onConfigSaved = () => localStorage.setItem(CONFIG_KEY, JSON.stringify(config))
+const loginPurpose = ref<'reset' | 'manual'>('reset')
+const manualCommandAuthorized = ref(false)
+async function onConfigSaved() {
+  try {
+    const saved = await saveAppConfig({ ...config })
+    Object.assign(config, { ...DEFAULT_CONFIG, ...saved.config })
+    addLog('success', `[配置] 已保存到文件: ${saved.filePath}`)
+    await restartBarcodeScanner()
+  } catch (err: any) {
+    addLog('error', `[配置] 保存失败: ${err?.message || err}`)
+  }
+}
 
 const productCode = ref('')
 const scanInputRef = ref<HTMLInputElement | null>(null)
 const focusScan = () => nextTick(() => scanInputRef.value?.focus())
-onMounted(focusScan)
+onMounted(() => {
+  focusScan()
+  clearSignal()
+  void loadConfigFromFile()
+})
+onUnmounted(() => {
+  stopScannerPolling()
+  void stopBarcodeScanner().catch(() => {})
+})
 
 const orderInfo = ref<OrderInfo | null>(null)
 const orderLoading = ref(false)
@@ -60,14 +82,223 @@ const apiRecords = ref<ApiRecord[]>([])
 const activeTab = ref<'route' | 'api' | 'log' | 'material' | 'torque'>('route')
 
 const torqueInteractionRef = ref<any>(null)
+const materialScannerRef = ref<any>(null)
 const materialVerificationLoading = ref(false)
 const materialVerificationSuccess = ref(false)
 const verifiedMaterials = ref<any[]>([])
 const processStartTime = ref(new Date().toLocaleString())
+const scannerRunning = ref(false)
+const scannerConnected = ref(false)
+const scannerLastCode = ref('')
+const scannerLastError = ref('')
+const scannerPollError = ref('')
+const scannerAfterId = ref(0)
+let scannerPollTimer: ReturnType<typeof setInterval> | null = null
+const SCANNER_EXCEPTION_LOG_INTERVAL_MS = 60_000
+let scannerExceptionLastLogAt = 0
+const SCANNER_CONNECTED_STABLE_MS = 2000
+const SCANNER_DISCONNECTED_STABLE_MS = 500
+let scannerConnectedTrueSince = 0
+let scannerConnectedFalseSince = 0
+
+function logScannerException(level: 'warn' | 'error', msg: string) {
+  const now = Date.now()
+  if (now - scannerExceptionLastLogAt < SCANNER_EXCEPTION_LOG_INTERVAL_MS) return
+  scannerExceptionLastLogAt = now
+  addLog(level, msg)
+}
+
+function setScannerConnectedImmediate(next: boolean) {
+  scannerConnected.value = next
+  scannerConnectedTrueSince = 0
+  scannerConnectedFalseSince = 0
+}
+
+function updateScannerConnectedStable(next: boolean) {
+  const now = Date.now()
+
+  if (next) {
+    scannerConnectedFalseSince = 0
+    if (scannerConnected.value) return
+    if (scannerConnectedTrueSince === 0) {
+      scannerConnectedTrueSince = now
+      return
+    }
+    if (now - scannerConnectedTrueSince >= SCANNER_CONNECTED_STABLE_MS) {
+      scannerConnected.value = true
+      scannerConnectedTrueSince = 0
+    }
+    return
+  }
+
+  scannerConnectedTrueSince = 0
+  if (!scannerConnected.value) {
+    scannerConnectedFalseSince = 0
+    scannerConnected.value = false
+    return
+  }
+  if (scannerConnectedFalseSince === 0) {
+    scannerConnectedFalseSince = now
+    return
+  }
+  if (now - scannerConnectedFalseSince >= SCANNER_DISCONNECTED_STABLE_MS) {
+    scannerConnected.value = false
+    scannerConnectedFalseSince = 0
+  }
+}
+
+const globalStatus = computed(() => {
+  if (materialVerificationLoading.value) {
+    return { cls: 'loading-mini', icon: '...', text: '正在向后台提交全物料验证，请稍候...' }
+  }
+  if (materialVerificationSuccess.value) {
+    return { cls: 'success-mini', icon: 'OK', text: '全物料后台验证已通过，即将进入定扭环节...' }
+  }
+  if (testResult.value === 'NG' && resultMessage.value) {
+    return { cls: 'fail-mini', icon: 'NG', text: `异常: ${resultMessage.value}` }
+  }
+  return null
+})
+
+async function loadConfigFromFile() {
+  try {
+    const fileConfig = await getAppConfig()
+    Object.assign(config, { ...DEFAULT_CONFIG, ...fileConfig })
+    addLog('success', '[配置] 已从 Config 文件加载')
+  } catch (err: any) {
+    addLog('warn', `[配置] 读取配置文件失败，使用默认配置: ${err?.message || err}`)
+  } finally {
+    await initBarcodeScanner()
+  }
+}
 
 function addLog(level: any, msg: string) {
   logs.value.unshift({ time: new Date().toLocaleTimeString(), level, msg })
   if (logs.value.length > 50) logs.value.pop()
+}
+
+function isScannerConfigValid() {
+  return !!config.scannerIp?.trim() && config.scannerPort > 0
+}
+
+async function initBarcodeScanner() {
+  if (!isScannerConfigValid()) {
+    addLog('warn', '[扫码枪] 未配置扫码枪IP/端口，扫码功能未启动')
+    scannerRunning.value = false
+    setScannerConnectedImmediate(false)
+    return
+  }
+
+  try {
+    const status = await startBarcodeScanner({
+      scannerIp: config.scannerIp.trim(),
+      scannerPort: Number(config.scannerPort),
+      barcodeRegex: config.barcodeRegex || '.*'
+    })
+
+    scannerRunning.value = status.running
+    updateScannerConnectedStable(Boolean(status.connected && !status.lastError))
+    scannerLastError.value = status.lastError || ''
+    addLog('success', `[扫码枪] 模块已启动: ${config.scannerIp}:${config.scannerPort}`)
+    startScannerPolling()
+  } catch (err: any) {
+    scannerRunning.value = false
+    setScannerConnectedImmediate(false)
+    addLog('error', `[扫码枪] 启动失败: ${err?.message || err}`)
+  }
+}
+
+async function restartBarcodeScanner() {
+  stopScannerPolling()
+  scannerAfterId.value = 0
+  scannerLastError.value = ''
+  scannerLastCode.value = ''
+  setScannerConnectedImmediate(false)
+  try {
+    await stopBarcodeScanner()
+  } catch {}
+  await initBarcodeScanner()
+}
+
+function startScannerPolling() {
+  stopScannerPolling()
+  scannerPollTimer = setInterval(() => {
+    void pollScannerEvents()
+  }, 300)
+}
+
+function stopScannerPolling() {
+  if (!scannerPollTimer) return
+  clearInterval(scannerPollTimer)
+  scannerPollTimer = null
+}
+
+async function pollScannerEvents() {
+  if (!scannerRunning.value) return
+
+  try {
+    const res = await pullBarcodeScannerEvents(scannerAfterId.value)
+    scannerPollError.value = ''
+    scannerRunning.value = res.running
+
+    const nextError = (res.lastError || '').trim()
+    if (nextError !== scannerLastError.value) {
+      scannerLastError.value = nextError
+      if (nextError) {
+        logScannerException('warn', `[扫码枪] ${nextError}`)
+      }
+    }
+    updateScannerConnectedStable(Boolean(res.running && res.connected && !nextError))
+
+    for (const event of res.events || []) {
+      scannerAfterId.value = Math.max(scannerAfterId.value, event.id)
+      handleScannerCode(event.code)
+    }
+  } catch (err: any) {
+    const msg = String(err?.message || err || '未知异常')
+    if (msg !== scannerPollError.value) {
+      scannerPollError.value = msg
+      logScannerException('error', `[扫码枪] 轮询失败: ${msg}`)
+    }
+    setScannerConnectedImmediate(false)
+  }
+}
+
+function handleScannerCode(rawCode: string) {
+  const code = rawCode.trim()
+  if (!code) return
+
+  scannerLastCode.value = code
+  addLog('info', `[扫码枪] 收到条码: ${code}`)
+
+  if (orderLoading.value || routeLoading.value || materialVerificationLoading.value) {
+    addLog('warn', '[扫码枪] 当前流程繁忙，已忽略本次扫码')
+    return
+  }
+
+  if (!orderInfo.value) {
+    productCode.value = code
+    void handleScan()
+    return
+  }
+
+  if (!materialVerificationSuccess.value) {
+    materialScannerRef.value?.consumeScannedCode?.(code)
+    return
+  }
+
+  addLog('warn', '[扫码枪] 当前阶段不接收扫码，请先复位后再扫下一件')
+}
+
+function emitLabviewResult(result: TestResult) {
+  if (!orderInfo.value) return
+
+  const orderCode = String(orderInfo.value.orderCode || orderInfo.value.order_Code || '')
+  const routeNo = String(orderInfo.value.route_No || orderInfo.value.routeNo || '')
+  const currentBarcode = productCode.value.trim()
+
+  writeSignal(result, orderCode, currentBarcode, routeNo)
+  addLog(result === 'OK' ? 'success' : 'warn', `[LabVIEW] 已写入 ${result} 信号`)
 }
 
 function resetAll() {
@@ -81,6 +312,7 @@ function resetAll() {
 async function handleScan() {
   const code = productCode.value.trim()
   if (!code || !config.technicsProcessCode) return
+  clearSignal()
   resetAll()
   addLog('info', `开始查询工单: ${code}`)
   orderLoading.value = true
@@ -168,7 +400,7 @@ function generateTasks(steps: RouteStep[]) {
 function handleSingleMaterialScan(material: { productCode: string, productCount: number }) {
   const rec: ApiRecord = {
     title: '单物料扫描验证',
-    url: 'LOCAL_MATCH',
+    url: config.singleMaterialApiUrl || 'LOCAL_MATCH',
     status: 'success',
     time: new Date().toLocaleTimeString(),
     reqBody: material,
@@ -179,7 +411,7 @@ function handleSingleMaterialScan(material: { productCode: string, productCount:
 
 async function handleMaterialComplete(materials: { productCode: string, productCount: number }[]) {
   if (!orderInfo.value || materialVerificationLoading.value || materialVerificationSuccess.value) {
-    console.warn('[调试] 验证已在进行中或已成功，跳过重复触发')
+    console.warn('[调试] 验证正在进行中或已成功，跳过重复触发')
     return
   }
   
@@ -201,7 +433,7 @@ async function handleMaterialComplete(materials: { productCode: string, productC
   
   console.log('[调试] 全物料验证请求体:', JSON.stringify(reqData, null, 2))
 
-  const rec = reactive<ApiRecord>({ title: '全物料验证', url: '/mes-api/api/ProduceMessage/CompleteCheckInput', status: 'pending', time: new Date().toLocaleTimeString(), reqBody: reqData })
+  const rec = reactive<ApiRecord>({ title: '全物料验证', url: config.fullMaterialApiUrl, status: 'pending', time: new Date().toLocaleTimeString(), reqBody: reqData })
   apiRecords.value.unshift(rec)
   
   testResult.value = 'IDLE'
@@ -220,10 +452,10 @@ async function handleMaterialComplete(materials: { productCode: string, productC
     
     if (res && (res.code === 200 || res.code === "200" || res.success === true || res.msg === '操作成功')) {
       rec.status = 'success'
-      addLog('success', '✅ 全物料验证通过！')
+      addLog('success', '全物料验证通过')
       materialVerificationSuccess.value = true
-      verifiedMaterials.value = materials // 保存已验证的物料清单
-      testResult.value = 'IDLE' // 验证通过后状态回归待机，直到定扭开始
+      verifiedMaterials.value = materials
+      testResult.value = 'IDLE'
       resultMessage.value = '物料验证通过，请执行定扭交互'
 
       
@@ -235,7 +467,7 @@ async function handleMaterialComplete(materials: { productCode: string, productC
     } else {
       rec.status = 'error'
       const msg = res?.message || res?.msg || '未知错误'
-      addLog('error', `❌ 全物料验证失败: ${msg}`)
+      addLog('error', `全物料验证失败: ${msg}`)
       testResult.value = 'NG'
       resultMessage.value = `全物料验证未通过: ${msg}`
       alert(`全物料验证失败！\n原因: ${msg}\n请处理后再继续。`)
@@ -244,7 +476,7 @@ async function handleMaterialComplete(materials: { productCode: string, productC
     rec.status = 'error'
     testResult.value = 'NG'
     resultMessage.value = `请求异常: ${err.message}`
-    addLog('error', `❌ 全物料验证请求异常: ${err.message}`)
+    addLog('error', `全物料验证请求异常: ${err.message}`)
     alert(`全物料验证接口请求失败，请检查网络或配置。\n${err.message}`)
   } finally {
     materialVerificationLoading.value = false
@@ -252,7 +484,7 @@ async function handleMaterialComplete(materials: { productCode: string, productC
 }
 
 function startTighteningWorkflow() {
-  addLog('info', '[流程] 🚀 正在激活定扭交互组件...')
+  addLog('info', '[流程] 正在激活定扭交互组件...')
   activeTab.value = 'torque'
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.executeNextPendingTask()
@@ -270,11 +502,11 @@ function handleTaskFailed(failedTask: TighteningTask) {
   task.retryCount = (task.retryCount || 0) + 1
   
   testResult.value = 'NG'
-  resultMessage.value = `螺丝拧紧失败: ${task.itemDisplayName} (第 ${task.retryCount} 次尝试)`
+  resultMessage.value = `螺丝拧紧失败: ${task.itemDisplayName} (第${task.retryCount}次尝试)`
   addLog('error', `[流程] ${task.itemDisplayName} 拧紧失败，当前尝试次数: ${task.retryCount}`)
 
   if (task.retryCount < MAX_RETRIES) {
-    const wantRetry = confirm(`螺丝拧紧失败！\n螺丝: ${task.itemDisplayName}\n当前重试次数: ${task.retryCount} / ${MAX_RETRIES}\n\n点击“确定”：重新执行当前螺丝定扭\n点击“取消”：跳过当前螺丝（标记为失败）并继续下一个`)
+    const wantRetry = confirm(`螺丝拧紧失败。\n螺丝: ${task.itemDisplayName}\n当前重试次数: ${task.retryCount} / ${MAX_RETRIES}\n\n点击“确定”重试当前螺丝；点击“取消”跳过并继续下一颗。`)
     
     if (wantRetry) {
       task.result = 'PENDING'
@@ -295,8 +527,8 @@ function handleTaskFailed(failedTask: TighteningTask) {
       }
     }
   } else {
-    alert(`定扭失败次数已达上限 (${MAX_RETRIES}次)！\n螺丝: ${task.itemDisplayName}\n流程将停止，请手动复位。`)
-    addLog('error', `[流程] ${task.itemDisplayName} 达到重试上限，流程停止。`)
+    alert(`定扭失败次数达到上限 (${MAX_RETRIES}次)\n螺丝: ${task.itemDisplayName}\n流程将停止，请手动复位。`)
+    addLog('error', `[流程] ${task.itemDisplayName} 达到重试上限，流程停止`)
     if (torqueInteractionRef.value) {
       torqueInteractionRef.value.abortWorkflow()
     }
@@ -304,31 +536,33 @@ function handleTaskFailed(failedTask: TighteningTask) {
 }
 
 async function handleAllTasksComplete() {
-  addLog('success', '🎉 所有定扭任务已完成！准备备份并报工...')
+  addLog('success', '所有定扭任务已完成，准备备份并报工...')
   testResult.value = 'OK'
   resultMessage.value = '全部工序已完成，正在备份日志并报工...'
   
   // Submit MES first so the saved file contains the final upload request/response.
-  await submitAllDataToMes()
+  const submitOk = await submitAllDataToMes()
   
   // Save after submission, including both success and failure MES logs.
   await saveAllLogsToLocal()
+
+  emitLabviewResult(submitOk ? 'OK' : 'NG')
 }
 
 
-async function submitAllDataToMes() {
-  if (!orderInfo.value) return
+async function submitAllDataToMes(): Promise<boolean> {
+  if (!orderInfo.value) return false
 
   const t0 = Date.now()
   const nowStr = new Date().toLocaleDateString()
   const endTimeStr = new Date().toLocaleString()
   
-  // 1. 构建物料绑定步 (STEP1)
+  // 1. 鏋勫缓鐗╂枡缁戝畾姝?(STEP1)
   const step1Payload = {
     produceOrderCode: orderInfo.value.orderCode || orderInfo.value.order_Code || '',
     routeNo: orderInfo.value.route_No || orderInfo.value.routeNo || '',
     technicsProcessCode: config.technicsProcessCode,
-    technicsProcessName: "",
+    technicsProcessName: config.technicsProcessName || '',
     technicsStepCode: "STEP1",
     technicsStepName: "物料绑定",
     productCode: productCode.value,
@@ -337,9 +571,9 @@ async function submitAllDataToMes() {
     produceDate: nowStr,
     startTime: processStartTime.value,
     endTime: endTimeStr,
-    userName: currentUser.value?.username || "admin",
-    userAccount: currentUser.value?.username || "admin",
-    deviceCode: "",
+    userName: config.userName || currentUser.value?.username || "admin",
+    userAccount: config.userAccount || currentUser.value?.username || "admin",
+    deviceCode: config.deviceCode || "",
     Remarks: "",
     ProduceInEntityList: verifiedMaterials.value.map(m => ({
       productCode: m.productCode,
@@ -349,10 +583,10 @@ async function submitAllDataToMes() {
     ngEntityList: [],
     cellParamEntityList: [],
     otherParamEntityList: [],
-    deviceName: ""
+    deviceName: config.deviceName || ""
   }
 
-  // 2. 按工步对定扭任务进行分组 (STEP2, STEP3...)
+  // 2. 鎸夊伐姝ュ瀹氭壄浠诲姟杩涜鍒嗙粍 (STEP2, STEP3...)
   const torqueGroups = new Map<string, TighteningTask[]>()
   tighteningTasks.value.forEach(t => {
     const list = torqueGroups.get(t.workstepNo) || []
@@ -365,8 +599,8 @@ async function submitAllDataToMes() {
       produceOrderCode: orderInfo.value!.orderCode || orderInfo.value!.order_Code || '',
       routeNo: orderInfo.value!.route_No || orderInfo.value!.routeNo || '',
       technicsProcessCode: config.technicsProcessCode,
-      technicsProcessName: "",
-      technicsStepCode: stepNo, // 假设接口二返回的 workseqNo 对应 STEP2, STEP3...
+      technicsProcessName: config.technicsProcessName || "",
+      technicsStepCode: stepNo, // 鍋囪鎺ュ彛浜岃繑鍥炵殑 workseqNo 瀵瑰簲 STEP2, STEP3...
       technicsStepName: tasks[0].workstepName,
       productCode: productCode.value,
       productCount: tasks.length,
@@ -374,9 +608,9 @@ async function submitAllDataToMes() {
       produceDate: nowStr,
       startTime: processStartTime.value,
       endTime: endTimeStr,
-      userName: currentUser.value?.username || "admin",
-      userAccount: currentUser.value?.username || "admin",
-      deviceCode: "",
+      userName: config.userName || currentUser.value?.username || "admin",
+      userAccount: config.userAccount || currentUser.value?.username || "admin",
+      deviceCode: config.deviceCode || "",
       Remarks: "",
       ProduceInEntityList: [],
       produceParamEntityList: [],
@@ -415,7 +649,7 @@ async function submitAllDataToMes() {
           }
         ]
       })),
-      deviceName: ""
+      deviceName: config.deviceName || ""
     }
   })
 
@@ -423,13 +657,13 @@ async function submitAllDataToMes() {
   
   const rec = reactive<ApiRecord>({ 
     title: 'MES 报工上传', 
-    url: '/mes-push/api/ProduceMessage/PushPackMessageToMes', 
+    url: config.mesUploadApiUrl, 
     status: 'pending', 
     time: new Date().toLocaleTimeString(), 
     reqBody: finalPayload 
   })
   apiRecords.value.unshift(rec)
-  addLog('info', `[MES] 开始汇总报工数据 (共 ${finalPayload.length} 个工步)`)
+  addLog('info', `[MES] 开始汇总报工数据 (共${finalPayload.length}个工步)`)
 
   try {
     const res = await pushPackMessageToMes(config, finalPayload)
@@ -437,19 +671,22 @@ async function submitAllDataToMes() {
     rec.resBody = res
     if (res && (res.code === 200 || res.success === true)) {
       rec.status = 'success'
-      addLog('success', '✅ MES 报工完成: 结果已成功推送到生产服务器')
+      addLog('success', 'MES 报工完成：结果已成功推送到生产服务端')
       resultMessage.value = '报工已成功，当前流程已全部完成。'
+      return true
     } else {
       rec.status = 'error'
-      const failMsg = res?.message || res?.msg || '服务器拒绝'
-      addLog('error', `❌ MES 报工失败: ${failMsg}`)
+      const failMsg = res?.message || res?.msg || '服务端拒绝'
+      addLog('error', `MES 报工失败: ${failMsg}`)
       resultMessage.value = `报工失败: ${failMsg}`
+      return false
     }
   } catch (err: any) {
     rec.status = 'error'
     rec.resBody = err.message
-    addLog('error', `❌ MES 报工网络异常: ${err.message}`)
+    addLog('error', `MES 报工网络异常: ${err.message}`)
     resultMessage.value = `网络异常，报工未完成: ${err.message}`
+    return false
   }
 }
 
@@ -509,7 +746,7 @@ async function saveAllLogsToLocal() {
          const resData = JSON.parse(text);
          addLog('success', `[System] 日志已自动备份至本地: ${resData.path}`)
        } catch {
-         addLog('success', '[System] 日志备份请求已发送，但后台未返回确认信息')
+         addLog('success', '[System] 日志备份请求已发送，但后端未返回确认信息')
        }
     } else {
        const text = await response.text();
@@ -526,27 +763,30 @@ async function saveAllLogsToLocal() {
 
 
 async function resetResult() {
-  // 核心判定：只要输入了条码，且没有达到最终的“全部完成”状态，就需要管理员授权
   const isFinished = testResult.value === 'OK' && resultMessage.value.includes('已完成')
   const hasStarted = productCode.value.trim() !== ''
 
   if (hasStarted && !isFinished) {
-     showLogin.value = true
-     return
+    loginPurpose.value = 'reset'
+    showLogin.value = true
+    return
   }
   await executeReset()
 }
-
-
 async function handleAuthSuccess(user: User) {
-  currentUser.value = user
-  addLog('warn', `管理员 [${user.username}] 授权：执行强制复位`)
-  await executeReset()
-  currentUser.value = null // 授权完重置身份
-}
+  if (loginPurpose.value === 'manual') {
+    currentUser.value = user
+    manualCommandAuthorized.value = true
+    addLog('success', `[权限] 管理员[${user.username}] 已授权快捷下发`)
+    return
+  }
 
+  currentUser.value = user
+  addLog('warn', `[权限] 管理员[${user.username}] 授权：执行强制复位`)
+  await executeReset()
+  currentUser.value = null
+}
 async function executeReset() {
-  // 1. 尝试保存日志（不阻塞 UI 复位）
   if (productCode.value) {
     addLog('info', '正在后台备份当前流程日志...')
     saveAllLogsToLocal().catch(err => {
@@ -555,15 +795,17 @@ async function executeReset() {
     })
   }
 
-  // 2. 彻底清理前端状态，回到初始扫码状态
+  clearSignal()
   productCode.value = ''
   orderInfo.value = null
   routeSteps.value = []
   materialVerificationSuccess.value = false
+  materialVerificationLoading.value = false
+  manualCommandAuthorized.value = false
   testResult.value = 'IDLE'
   resultMessage.value = ''
-  activeTab.value = 'route' // 回到第一步标签页
-  
+  activeTab.value = 'route'
+
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.abortWorkflow()
     setTimeout(() => {
@@ -573,13 +815,14 @@ async function executeReset() {
 
   addLog('info', '----------------------------------------')
   addLog('info', '✅ 系统已全面复位，请扫描新工单')
-  
-  // 重新聚焦扫码框
   focusScan()
 }
 
-
-
+function requestManualCommandAuth() {
+  if (manualCommandAuthorized.value) return
+  loginPurpose.value = 'manual'
+  showLogin.value = true
+}
 </script>
 
 <template>
@@ -600,7 +843,7 @@ async function executeReset() {
       </div>
       <div class="header-right">
         <button class="icon-btn" title="系统配置" @click="showConfig = true">
-          ⚙️ 配置
+          配置
         </button>
       </div>
     </header>
@@ -613,26 +856,30 @@ async function executeReset() {
             <span class="step-badge">1</span>
             扫描产品条码
           </div>
+          <div class="scan-status-line">
+            <span :class="scannerConnected ? 'status-ok' : 'status-warn'">
+              {{ scannerConnected ? '扫码枪已连接' : '扫码枪未连接' }}
+            </span>
+            <span v-if="scannerLastCode" class="last-scan-code">最近扫码: {{ scannerLastCode }}</span>
+          </div>
           <div class="scan-input-wrap" :class="{ 'scanning': orderLoading }">
-            <span class="scan-icon">📷</span>
             <input
               ref="scanInputRef"
               v-model="productCode"
               type="text"
-              placeholder="请扫描或输入产品条码..."
+              placeholder="等待扫码枪输入产品条码..."
               class="scan-input"
-              :disabled="orderLoading || routeLoading"
-              @keydown.enter="handleScan"
+              :disabled="true"
+              readonly
             />
             <button
               class="scan-btn"
-              :disabled="orderLoading || !productCode.trim()"
-              @click="handleScan"
+              :disabled="true"
             >
-              {{ orderLoading ? '查询中...' : '查询' }}
+              扫码触发
             </button>
           </div>
-          <p class="scan-hint">扫描后请按 <kbd>Enter</kbd> 提交</p>
+          <p class="scan-hint">仅允许扫码枪输入，已禁用人工键盘录入</p>
         </div>
 
         <div class="card info-card">
@@ -643,7 +890,7 @@ async function executeReset() {
           </div>
 
           <div v-if="orderError" class="error-box">
-            <span>⚠️</span> {{ orderError }}
+            <span>!</span> {{ orderError }}
           </div>
 
           <div v-else-if="orderInfo" class="info-grid">
@@ -681,7 +928,7 @@ async function executeReset() {
 
           <div class="result-display" :class="testResult.toLowerCase()">
             <span class="result-icon">
-              {{ testResult === 'OK' ? '✅' : testResult === 'NG' ? '❌' : '⏳' }}
+              {{ testResult === 'OK' ? '✓' : testResult === 'NG' ? '✗' : '…' }}
             </span>
             <span class="result-text">
               {{ testResult === 'IDLE' ? '待执行' : testResult }}
@@ -694,7 +941,7 @@ async function executeReset() {
             class="btn-reset"
             @click="resetResult"
           >
-            🔄 复位状态 / 准备下一件
+            复位状态 / 准备下一件
           </button>
 
 
@@ -702,14 +949,18 @@ async function executeReset() {
       </section>
 
       <section class="right-panel">
-        <!-- 标签栏 -->
+        <div v-if="globalStatus" class="global-status status-banner" :class="globalStatus.cls">
+          <span class="global-status-icon">{{ globalStatus.icon }}</span>
+          <span>{{ globalStatus.text }}</span>
+        </div>
+        <!-- 鏍囩鏍?-->
         <div class="tab-bar">
           <button
             class="tab-btn"
             :class="{ active: activeTab === 'route' }"
             @click="activeTab = 'route'"
           >
-            <span>📋</span> 工步列表
+            工步列表
             <span v-if="routeSteps.length" class="tab-count">{{ routeSteps.length }}</span>
           </button>
           <button
@@ -717,21 +968,21 @@ async function executeReset() {
             :class="{ active: activeTab === 'material' }"
             @click="activeTab = 'material'"
           >
-            <span>📦</span> 物料验证
+            物料验证
           </button>
           <button
             class="tab-btn"
             :class="{ active: activeTab === 'torque' }"
             @click="activeTab = 'torque'"
           >
-            <span>🔧</span> 定扭交互
+            定扭交互
           </button>
           <button
             class="tab-btn"
             :class="{ active: activeTab === 'api' }"
             @click="activeTab = 'api'"
           >
-            <span>🔌</span> 接口交互
+            接口交互
             <span v-if="apiRecords.length" class="tab-count">{{ apiRecords.length }}</span>
           </button>
           <button
@@ -739,36 +990,25 @@ async function executeReset() {
             :class="{ active: activeTab === 'log' }"
             @click="activeTab = 'log'"
           >
-            <span>📄</span> 操作日志
+            操作日志
             <span v-if="logs.length" class="tab-count">{{ logs.length }}</span>
           </button>
         </div>
 
-        <!-- 标签内容区 -->
+        <!-- 鏍囩鍐呭鍖?-->
         <div class="tab-content">
-          <!-- 工步列表 -->
+          <!-- 宸ユ鍒楄〃 -->
           <div v-show="activeTab === 'route'" class="tab-pane">
             <div v-if="routeError" class="error-box">
-              <span>⚠️</span> {{ routeError }}
+              <span>!</span> {{ routeError }}
             </div>
             <RouteTable :steps="routeSteps" :loading="routeLoading" />
           </div>
 
-          <!-- 物料验证 -->
-          <div v-show="activeTab === 'material'" class="tab-pane flex-column">
-            <div v-if="materialVerificationLoading" class="status-banner loading-mini">
-              <span class="spinner-icon">⏳</span>
-              <span>正在向后台提交全物料验证，请稍候...</span>
-            </div>
-            <div v-if="materialVerificationSuccess && activeTab === 'material'" class="status-banner success-mini">
-              <span class="pulse-icon">✅</span>
-              <span>全物料后台验证已通过，即将进入定扭环节...</span>
-            </div>
-            <div v-if="testResult === 'NG' && activeTab === 'material'" class="status-banner fail-mini">
-              <span class="pulse-icon">❌</span>
-              <span>物料验证异常: {{ resultMessage }}</span>
-            </div>
+          <!-- 鐗╂枡楠岃瘉 -->
+          <div v-show="activeTab === 'material'" class="tab-pane material-pane">
             <MaterialScanner 
+              ref="materialScannerRef"
               :steps="routeSteps" 
               @log="addLog"
               @single-complete="handleSingleMaterialScan"
@@ -776,10 +1016,10 @@ async function executeReset() {
             />
 
 
-            <!-- 定扭判定矩阵表格 (已按需移动至物料下方) -->
+            <!-- 瀹氭壄鍒ゅ畾鐭╅樀琛ㄦ牸 (宸叉寜闇€绉诲姩鑷崇墿鏂欎笅鏂? -->
             <div class="tightening-matrix-card-modern">
               <div class="matrix-header-modern">
-                <span class="matrix-title">🔥 定扭判定矩阵 (基于工单工步自动展解)</span>
+                <span class="matrix-title">定扭判定矩阵 (基于工单工步自动展开)</span>
                 <button class="btn-text-modern" @click="tighteningTasks.forEach(t => { t.actualTorque = null; t.actualAngle = null; t.result = 'PENDING'; })">重置进度</button>
               </div>
               <div class="matrix-table-wrap">
@@ -818,7 +1058,7 @@ async function executeReset() {
                           <span v-if="task.retryCount > 0" class="retry-count">x{{ task.retryCount }}</span>
                           <span v-else class="retry-zero">--</span>
                           <div v-if="task.history && task.history.length > 1" class="history-preview" :title="task.history.map(h => `${h.timestamp}: ${h.torque}Nm / ${h.angle}Deg [${h.result}]`).join('\n')">
-                            📜 历史
+                            历史
                           </div>
                         </div>
                       </td>
@@ -832,25 +1072,27 @@ async function executeReset() {
             </div>
           </div>
 
-          <!-- 定扭交互 -->
+          <!-- 瀹氭壄浜や簰 -->
           <div v-show="activeTab === 'torque'" class="tab-pane">
             <TorqueInteraction 
               ref="torqueInteractionRef"
               :ip="config.desoutterIp"
               :port="config.desoutterPort"
+              :manual-command-authorized="manualCommandAuthorized"
               v-model:tasks="tighteningTasks"
               @log="addLog"
               @taskFailed="handleTaskFailed"
               @allTasksComplete="handleAllTasksComplete"
+              @request-manual-auth="requestManualCommandAuth"
             />
           </div>
 
-          <!-- 接口交互详情 -->
+          <!-- 鎺ュ彛浜や簰璇︽儏 -->
           <div v-show="activeTab === 'api'" class="tab-pane">
             <ApiDetail :records="apiRecords" />
           </div>
 
-          <!-- 操作日志 -->
+          <!-- 鎿嶄綔鏃ュ織 -->
           <div v-show="activeTab === 'log'" class="tab-pane log-pane">
             <div class="log-scroll">
               <div
@@ -869,7 +1111,7 @@ async function executeReset() {
       </section>
     </main>
 
-    <!-- 配置弹窗 -->
+    <!-- 閰嶇疆寮圭獥 -->
     <ConfigModal
       v-model="config"
       v-model:visible="showConfig"
@@ -888,7 +1130,7 @@ async function executeReset() {
 
 
 <style scoped>
-/* 鏍瑰鍣?*/
+/* 閺嶇懓顔愰崳?*/
 .app-root {
   display: flex;
   flex-direction: column;
@@ -900,7 +1142,7 @@ async function executeReset() {
   overflow: hidden;
 }
 
-/* 椤堕儴鏍囬鏍?*/
+/* 妞ゅ爼鍎撮弽鍥暯閺?*/
 .app-header {
   display: flex;
   align-items: center;
@@ -999,7 +1241,7 @@ async function executeReset() {
   color: #e3f2fd;
 }
 
-/* 主体 */
+/* 涓讳綋 */
 .app-main {
   display: flex;
   gap: 12px;
@@ -1028,7 +1270,12 @@ async function executeReset() {
   border-radius: 10px;
 }
 
-/* 鏍囩鏍?*/
+.global-status {
+  margin: 10px 10px 0;
+  flex-shrink: 0;
+}
+
+/* 閺嶅洨顒烽弽?*/
 .tab-bar {
   display: flex;
   gap: 2px;
@@ -1091,7 +1338,7 @@ async function executeReset() {
   background: rgba(66, 165, 245, 0.3);
 }
 
-/* 鏍囩鍐呭鍖?*/
+/* 閺嶅洨顒烽崘鍛啇閸?*/
 .tab-content {
   flex: 1;
   overflow: hidden;
@@ -1104,13 +1351,18 @@ async function executeReset() {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+}
+
+.material-pane {
+  min-height: 0;
 }
 
 .log-pane {
   padding: 10px;
 }
 
-/* 閫氱敤鍗＄墖 */
+/* 闁氨鏁ら崡锛勫 */
 .card {
   background: #131929;
   border: 1px solid rgba(100, 181, 246, 0.12);
@@ -1170,7 +1422,7 @@ async function executeReset() {
   font-weight: 500;
 }
 
-/* 扫码输入 */
+/* 鎵爜杈撳叆 */
 .scan-input-wrap {
   display: flex;
   align-items: center;
@@ -1243,6 +1495,31 @@ async function executeReset() {
   margin: 6px 0 0 0;
 }
 
+.scan-status-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.status-ok {
+  color: #00e676;
+}
+
+.status-warn {
+  color: #ffab40;
+}
+
+.last-scan-code {
+  color: #80cbc4;
+  font-family: 'Consolas', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 kbd {
   background: rgba(100, 181, 246, 0.1);
   border: 1px solid rgba(100, 181, 246, 0.2);
@@ -1252,7 +1529,7 @@ kbd {
   color: #64b5f6;
 }
 
-/* 宸ュ崟淇℃伅 */
+/* 瀹搞儱宕熸穱鈩冧紖 */
 .info-grid {
   display: flex;
   flex-direction: column;
@@ -1300,7 +1577,7 @@ kbd {
   padding: 16px 0;
 }
 
-/* OK/NG 结果 */
+/* OK/NG 缁撴灉 */
 .result-display {
   display: flex;
   align-items: center;
@@ -1416,7 +1693,7 @@ kbd {
   border-color: #42a5f5;
 }
 
-/* 閿欒妗?*/
+/* 闁挎瑨顕ゅ?*/
 .error-box {
   background: rgba(244, 67, 54, 0.08);
   border: 1px solid rgba(244, 67, 54, 0.25);
@@ -1430,7 +1707,7 @@ kbd {
   margin-bottom: 8px;
 }
 
-/* 鍔犺浇鍔ㄧ敾 */
+/* 閸旂姾娴囬崝銊ф暰 */
 .loading-spin {
   width: 14px;
   height: 14px;
@@ -1441,7 +1718,7 @@ kbd {
   margin-left: auto;
 }
 
-/* 鏃ュ織 */
+/* 閺冦儱绻?*/
 .log-scroll {
   flex: 1;
   overflow-y: auto;
@@ -1498,11 +1775,17 @@ kbd {
   gap: 12px;
   padding: 12px 16px;
   border-radius: 8px;
-  margin-bottom: 16px;
   font-weight: 600;
   font-size: 14px;
   animation: slideDown 0.3s ease-out;
 }
+
+.global-status-icon {
+  font-size: 12px;
+  font-family: 'Consolas', monospace;
+  letter-spacing: 0.5px;
+}
+
 .success-mini {
   background: rgba(0, 230, 118, 0.1);
   border: 1px solid rgba(0, 230, 118, 0.2);
@@ -1518,37 +1801,20 @@ kbd {
   border: 1px solid rgba(255, 152, 0, 0.2);
   color: #ff9800;
 }
-.pulse-icon {
-  font-size: 18px;
-  animation: pulse 2s infinite;
-}
-.spinner-icon {
-  font-size: 18px;
-  display: inline-block;
-  animation: rotate 2s linear infinite;
-}
-
-@keyframes rotate {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
 
 @keyframes slideDown {
   from { opacity: 0; transform: translateY(-10px); }
   to { opacity: 1; transform: translateY(0); }
 }
-@keyframes pulse {
-  0% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.1); opacity: 0.8; }
-  100% { transform: scale(1); opacity: 1; }
-}
 
-
-/* 定扭判定矩阵 (瀵归綈物料验证 UI) */
+/* 瀹氭壄鍒ゅ畾鐭╅樀 */
 .tightening-matrix-card-modern {
-  margin-top: 24px;
+  margin-top: 16px;
   border-top: 1px solid rgba(100, 181, 246, 0.1);
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .matrix-header-modern {
@@ -1569,6 +1835,14 @@ kbd {
   gap: 8px;
 }
 
+.matrix-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(100, 181, 246, 0.2) transparent;
+}
+
 .matrix-table-modern {
   width: 100%;
   border-collapse: collapse;
@@ -1576,12 +1850,15 @@ kbd {
 }
 
 .matrix-table-modern th {
-  background: rgba(21, 101, 192, 0.2);
+  background: #0d1117;
   color: #78909c;
   text-align: left;
   padding: 8px 12px;
   font-weight: 600;
   border-bottom: 1px solid rgba(100, 181, 246, 0.1);
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 .matrix-table-modern td {
@@ -1639,77 +1916,5 @@ kbd {
   opacity: 0.8;
 }
 .history-preview:hover { opacity: 1; }
-
-
-/* 定扭判定矩阵 (对齐物料验证 UI) */
-.tightening-matrix-card-modern {
-  margin-top: 24px;
-  border-top: 1px solid rgba(100, 181, 246, 0.1);
-  display: flex;
-  flex-direction: column;
-}
-
-.matrix-header-modern {
-  padding: 12px 14px;
-  background: rgba(13, 71, 161, 0.15);
-  border-bottom: 1px solid rgba(100, 181, 246, 0.1);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.matrix-title {
-  color: #e3f2fd;
-  font-size: 13px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.matrix-table-wrap {
-  flex: 1;
-  max-height: 500px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(100, 181, 246, 0.2) transparent;
-}
-
-.matrix-table-modern {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-
-.matrix-table-modern th {
-  background: #0d1117;
-  color: #78909c;
-  text-align: left;
-  padding: 8px 12px;
-  font-weight: 600;
-  border-bottom: 1px solid rgba(100, 181, 246, 0.1);
-  position: sticky;
-  top: 0;
-  z-index: 10;
-}
-
-.matrix-table-modern td {
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(100, 181, 246, 0.05);
-  color: #cfd8dc;
-}
-
-.badge {
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 10px;
-  font-weight: 600;
-  display: inline-block;
-}
-
-.badge.pass { background: rgba(0, 230, 118, 0.15); color: #00e676; }
-.badge.fail { background: rgba(244, 67, 54, 0.15); color: #f44336; }
-.badge.pending { background: rgba(255, 171, 64, 0.15); color: #ffab40; }
-
-.matrix-mono { font-family: 'Consolas', monospace; color: #64b5f6; }
 </style>
+

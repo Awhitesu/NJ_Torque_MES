@@ -1,0 +1,29 @@
+{
+  "Mes": {
+    "OrderApiUrl": "/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess",
+    "RouteApiUrl": "/mes-api/api/OrderInfo/GetTechRouteListByCode",
+    "SingleMaterialApiUrl": "/mes-api/api/ProduceMessage/SingleCheckInput",
+    "FullMaterialApiUrl": "/mes-api/api/ProduceMessage/CompleteCheckInput",
+    "MesUploadApiUrl": "/mes-push/api/ProduceMessage/PushPackMessageToMes",
+    "TechnicsProcessCode": "CTP_P1240",
+    "TechnicsProcessName": "CTP_P1240",
+    "UserName": "admin",
+    "UserAccount": "admin",
+    "DeviceCode": "",
+    "DeviceName": ""
+  },
+  "TorqueController": {
+    "Ip": "192.168.5.212",
+    "Port": 4547
+  },
+  "Scanner": {
+    "Ip": "192.168.187.31",
+    "Port": 51000,
+    "BarcodeRegex": "^[0-9a-zA-Z]{24}$"
+  },
+  "System": {
+    "LogSavePath": "D:\\NJ_Torque_Logs",
+    "AdminUsername": "admin",
+    "AdminPassword": "123"
+  }
+}
