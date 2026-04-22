@@ -17,8 +17,12 @@ public class AppConfigFileService
         _logger = logger;
 
         var contentRoot = env.ContentRootPath;
-        var projectRoot = Directory.GetParent(contentRoot)?.Parent?.FullName ?? contentRoot;
-        _configDirectory = Path.Combine(projectRoot, "Config");
+        var parentRoot = Directory.GetParent(contentRoot)?.Parent?.FullName ?? contentRoot;
+        var parentConfig = Path.Combine(parentRoot, "Config");
+        var localConfig = Path.Combine(contentRoot, "Config");
+        _configDirectory = Directory.Exists(parentConfig) || File.Exists(Path.Combine(parentConfig, "app-config.json"))
+            ? parentConfig
+            : localConfig;
         _configFilePath = Path.Combine(_configDirectory, "app-config.json");
 
         LoadOrCreate();
@@ -49,6 +53,22 @@ public class AppConfigFileService
         lock (_sync)
         {
             return _runtimeConfig.System.LogSavePath;
+        }
+    }
+
+    public string GetMesApiProxyTarget()
+    {
+        lock (_sync)
+        {
+            return _runtimeConfig.Proxy.MesApiProxyTarget;
+        }
+    }
+
+    public string GetMesPushProxyTarget()
+    {
+        lock (_sync)
+        {
+            return _runtimeConfig.Proxy.MesPushProxyTarget;
         }
     }
 
@@ -93,10 +113,15 @@ public class AppConfigFileService
     private static AppRuntimeFileConfig Normalize(AppRuntimeFileConfig cfg)
     {
         var d = AppRuntimeFileConfig.CreateDefault();
+        cfg.Proxy ??= new ProxySection();
         cfg.Mes ??= new MesConfigSection();
         cfg.TorqueController ??= new TorqueControllerSection();
         cfg.Scanner ??= new ScannerSection();
         cfg.System ??= new SystemSection();
+
+        cfg.Proxy.ApiBaseUrl = KeepOrDefault(cfg.Proxy.ApiBaseUrl, d.Proxy.ApiBaseUrl);
+        cfg.Proxy.MesApiProxyTarget = KeepOrDefault(cfg.Proxy.MesApiProxyTarget, d.Proxy.MesApiProxyTarget);
+        cfg.Proxy.MesPushProxyTarget = KeepOrDefault(cfg.Proxy.MesPushProxyTarget, d.Proxy.MesPushProxyTarget);
 
         cfg.Mes.OrderApiUrl = KeepOrDefault(cfg.Mes.OrderApiUrl, d.Mes.OrderApiUrl);
         cfg.Mes.RouteApiUrl = KeepOrDefault(cfg.Mes.RouteApiUrl, d.Mes.RouteApiUrl);
@@ -140,6 +165,9 @@ public class AppConfigFileService
     {
         return new AppConfigDto
         {
+            ApiBaseUrl = cfg.Proxy.ApiBaseUrl,
+            MesApiProxyTarget = cfg.Proxy.MesApiProxyTarget,
+            MesPushProxyTarget = cfg.Proxy.MesPushProxyTarget,
             OrderApiUrl = cfg.Mes.OrderApiUrl,
             RouteApiUrl = cfg.Mes.RouteApiUrl,
             SingleMaterialApiUrl = cfg.Mes.SingleMaterialApiUrl,
@@ -167,6 +195,12 @@ public class AppConfigFileService
     {
         return new AppRuntimeFileConfig
         {
+            Proxy = new ProxySection
+            {
+                ApiBaseUrl = dto.ApiBaseUrl,
+                MesApiProxyTarget = dto.MesApiProxyTarget,
+                MesPushProxyTarget = dto.MesPushProxyTarget
+            },
             Mes = new MesConfigSection
             {
                 OrderApiUrl = dto.OrderApiUrl,

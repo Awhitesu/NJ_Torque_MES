@@ -2,6 +2,9 @@ namespace MesScanner.Backend.Models;
 
 public class AppConfigDto
 {
+    public string ApiBaseUrl { get; set; } = "/api";
+    public string MesApiProxyTarget { get; set; } = string.Empty;
+    public string MesPushProxyTarget { get; set; } = string.Empty;
     public string OrderApiUrl { get; set; } = string.Empty;
     public string RouteApiUrl { get; set; } = string.Empty;
     public string SingleMaterialApiUrl { get; set; } = string.Empty;
@@ -29,6 +32,7 @@ public class AppConfigDto
 
 public class AppRuntimeFileConfig
 {
+    public ProxySection Proxy { get; set; } = new();
     public MesConfigSection Mes { get; set; } = new();
     public TorqueControllerSection TorqueController { get; set; } = new();
     public ScannerSection Scanner { get; set; } = new();
@@ -38,6 +42,12 @@ public class AppRuntimeFileConfig
     {
         return new AppRuntimeFileConfig
         {
+            Proxy = new ProxySection
+            {
+                ApiBaseUrl = "/api",
+                MesApiProxyTarget = "http://172.25.57.144:8076",
+                MesPushProxyTarget = "http://172.25.57.144:8072"
+            },
             Mes = new MesConfigSection
             {
                 OrderApiUrl = "/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess",
@@ -72,6 +82,13 @@ public class AppRuntimeFileConfig
             }
         };
     }
+}
+
+public class ProxySection
+{
+    public string ApiBaseUrl { get; set; } = "/api";
+    public string MesApiProxyTarget { get; set; } = string.Empty;
+    public string MesPushProxyTarget { get; set; } = string.Empty;
 }
 
 public class MesConfigSection

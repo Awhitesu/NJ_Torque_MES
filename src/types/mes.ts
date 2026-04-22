@@ -1,7 +1,10 @@
-// MES系统接口类型定义
+﻿// MES系统接口类型定义
 
 /** 应用配置 */
 export interface AppConfig {
+  apiBaseUrl?: string
+  mesApiProxyTarget?: string
+  mesPushProxyTarget?: string
   /** 非首段工序API地址 */
   orderApiUrl: string
   /** 工步工序API地址 */
@@ -252,3 +255,4 @@ export interface MesSubmission {
   }>
   deviceName: string
 }
+

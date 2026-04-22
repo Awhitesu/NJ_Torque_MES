@@ -1,7 +1,8 @@
 ﻿<script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { HubConnectionBuilder, LogLevel } from '@microsoft/signalr'
 import type { TighteningTask } from '../types/mes'
+import { buildFromApiBase } from '../services/apiBase'
 
 type UiLogLevel = 'info' | 'success' | 'warn' | 'error'
 
@@ -15,6 +16,7 @@ const props = defineProps<{
   ip: string
   port: number
   tasks: TighteningTask[]
+  apiBaseUrl?: string
   manualCommandAuthorized: boolean
 }>()
 
@@ -45,7 +47,7 @@ const isPreparingTask = ref(false)
 const armedTaskId = ref<string | null>(null)
 const workflowAborted = ref(false)
 
-const backendBaseUrl = 'http://127.0.0.1:5246'
+const backendBaseUrl = computed(() => buildFromApiBase(props.apiBaseUrl, ''))
 
 let connection: any = null
 
@@ -105,7 +107,7 @@ function normalizeLevel(raw: unknown): UiLogLevel {
 
 async function initSignalR() {
   connection = new HubConnectionBuilder()
-    .withUrl('/api/torqueHub')
+    .withUrl(buildFromApiBase(props.apiBaseUrl, '/torqueHub'))
     .withAutomaticReconnect()
     .configureLogging(LogLevel.Information)
     .build()
@@ -207,7 +209,7 @@ async function initSignalR() {
 }
 
 async function sendCommandToBackend(mid: string, pset = '') {
-  const response = await fetch(`${backendBaseUrl}/command?mid=${mid}&pset=${pset}`, {
+  const response = await fetch(`${backendBaseUrl.value}/command?mid=${mid}&pset=${pset}`, {
     method: 'POST'
   })
   if (!response.ok) {
@@ -217,7 +219,7 @@ async function sendCommandToBackend(mid: string, pset = '') {
 }
 
 async function syncControllerConfig(reconnect: boolean) {
-  const response = await fetch(`${backendBaseUrl}/controller/config`, {
+  const response = await fetch(`${backendBaseUrl.value}/controller/config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -470,7 +472,7 @@ async function handleConnect() {
 async function handleDisconnect() {
   logLocal('info', '[System] Request backend to disconnect controller...')
   try {
-    await fetch(`${backendBaseUrl}/disconnect`, { method: 'POST' })
+    await fetch(`${backendBaseUrl.value}/disconnect`, { method: 'POST' })
     isConnected.value = false
     isPSetSet.value = false
     isToolEnabled.value = false
@@ -1277,4 +1279,5 @@ defineExpose({
 
 .mono { font-family: 'Consolas', monospace; }
 </style>
+
 

@@ -1,4 +1,9 @@
 {
+  "Proxy": {
+    "ApiBaseUrl": "/api",
+    "MesApiProxyTarget": "http://172.25.57.144:8076",
+    "MesPushProxyTarget": "http://172.25.57.144:8072"
+  },
   "Mes": {
     "OrderApiUrl": "/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess",
     "RouteApiUrl": "/mes-api/api/OrderInfo/GetTechRouteListByCode",

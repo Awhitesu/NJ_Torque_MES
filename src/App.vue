@@ -13,8 +13,12 @@ import type { User } from './types/mes'
 import { clearSignal, writeSignal } from './utils/labviewSignal'
 import { pullBarcodeScannerEvents, startBarcodeScanner, stopBarcodeScanner } from './services/barcodeScannerApi'
 import { getAppConfig, saveAppConfig } from './services/appConfigApi'
+import { buildFromApiBase, setRuntimeApiBaseUrl } from './services/apiBase'
 
 const DEFAULT_CONFIG: AppConfig = {
+  apiBaseUrl: '/api',
+  mesApiProxyTarget: 'http://172.25.57.144:8076',
+  mesPushProxyTarget: 'http://172.25.57.144:8072',
   orderApiUrl: '/mes-api/api/OrderInfo/GetOtherOrderInfoByProcess',
   routeApiUrl: '/mes-api/api/OrderInfo/GetTechRouteListByCode',
   singleMaterialApiUrl: '/mes-api/api/ProduceMessage/SingleCheckInput',
@@ -39,6 +43,7 @@ const DEFAULT_CONFIG: AppConfig = {
 }
 
 const config = reactive<AppConfig>({ ...DEFAULT_CONFIG })
+setRuntimeApiBaseUrl(config.apiBaseUrl)
 const showConfig = ref(false)
 const showLogin = ref(false)
 const currentUser = ref<User | null>(null)
@@ -48,6 +53,7 @@ async function onConfigSaved() {
   try {
     const saved = await saveAppConfig({ ...config })
     Object.assign(config, { ...DEFAULT_CONFIG, ...saved.config })
+    setRuntimeApiBaseUrl(config.apiBaseUrl)
     addLog('success', `[配置] 已保存到文件: ${saved.filePath}`)
     await restartBarcodeScanner()
   } catch (err: any) {
@@ -194,6 +200,7 @@ async function loadConfigFromFile() {
   try {
     const fileConfig = await getAppConfig()
     Object.assign(config, { ...DEFAULT_CONFIG, ...fileConfig })
+    setRuntimeApiBaseUrl(config.apiBaseUrl)
     addLog('success', '[配置] 已从 Config 文件加载')
   } catch (err: any) {
     addLog('warn', `[配置] 读取配置文件失败，使用默认配置: ${err?.message || err}`)
@@ -759,7 +766,7 @@ async function saveAllLogsToLocal() {
   })
   
   try {
-    const response = await fetch('http://127.0.0.1:5246/saveLogs', {
+    const response = await fetch(buildFromApiBase(config.apiBaseUrl, '/saveLogs'), {
 
 
       method: 'POST',
@@ -1103,6 +1110,7 @@ function requestManualCommandAuth() {
                 ref="torqueInteractionRef"
                 :ip="config.desoutterIp"
                 :port="config.desoutterPort"
+                :api-base-url="config.apiBaseUrl"
                 :manual-command-authorized="manualCommandAuthorized"
                 v-model:tasks="tighteningTasks"
                 @log="addLog"
@@ -1964,5 +1972,61 @@ kbd {
   opacity: 0.8;
 }
 .history-preview:hover { opacity: 1; }
+
+@media (max-width: 1027px) and (max-height: 768px) {
+  .app-header {
+    height: 46px;
+    padding: 0 12px;
+    gap: 10px;
+  }
+
+  .brand-title {
+    font-size: 13px;
+  }
+
+  .brand-sub {
+    display: none;
+  }
+
+  .process-badge {
+    padding: 5px 12px;
+  }
+
+  .process-badge .label {
+    font-size: 12px;
+  }
+
+  .process-badge .value {
+    font-size: 14px;
+  }
+
+  .app-main {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .left-panel {
+    width: 325px;
+    gap: 8px;
+  }
+
+  .card {
+    padding: 10px;
+  }
+
+  .tab-bar {
+    padding: 6px 8px 0;
+  }
+
+  .tab-btn {
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+
+  .status-banner {
+    font-size: 13px;
+    padding: 10px 12px;
+  }
+}
 </style>
 

@@ -1,11 +1,12 @@
 import type { AppConfig } from '../types/mes'
+import { withApiBase } from './apiBase'
 
 interface SaveConfigResponse {
   config: AppConfig
   filePath: string
 }
 
-const baseUrl = '/api/app-config'
+const getBaseUrl = () => withApiBase('/app-config')
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -17,11 +18,11 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function getAppConfig() {
-  return requestJson<AppConfig>(baseUrl)
+  return requestJson<AppConfig>(getBaseUrl())
 }
 
 export function saveAppConfig(config: AppConfig) {
-  return requestJson<SaveConfigResponse>(baseUrl, {
+  return requestJson<SaveConfigResponse>(getBaseUrl(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(config)
@@ -29,7 +30,7 @@ export function saveAppConfig(config: AppConfig) {
 }
 
 export function pickConfigDirectory(title: string) {
-  return requestJson<{ path: string }>(`${baseUrl}/pick-directory`, {
+  return requestJson<{ path: string }>(`${getBaseUrl()}/pick-directory`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title })

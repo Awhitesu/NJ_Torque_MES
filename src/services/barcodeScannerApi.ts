@@ -31,7 +31,7 @@ export interface BarcodeScannerStatusResponse {
   ioLogs: string[]
 }
 
-const baseUrl = '/api/barcodeScanner'
+const getBaseUrl = () => withApiBase('/barcodeScanner')
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -43,7 +43,7 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function startBarcodeScanner(req: BarcodeScannerStartRequest) {
-  return requestJson<BarcodeScannerStatusResponse>(`${baseUrl}/start`, {
+  return requestJson<BarcodeScannerStatusResponse>(`${getBaseUrl()}/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req)
@@ -51,15 +51,16 @@ export function startBarcodeScanner(req: BarcodeScannerStartRequest) {
 }
 
 export function stopBarcodeScanner() {
-  return requestJson<BarcodeScannerStatusResponse>(`${baseUrl}/stop`, {
+  return requestJson<BarcodeScannerStatusResponse>(`${getBaseUrl()}/stop`, {
     method: 'POST'
   })
 }
 
 export function getBarcodeScannerStatus() {
-  return requestJson<BarcodeScannerStatusResponse>(`${baseUrl}/status`)
+  return requestJson<BarcodeScannerStatusResponse>(`${getBaseUrl()}/status`)
 }
 
 export function pullBarcodeScannerEvents(afterId: number) {
-  return requestJson<BarcodeScannerPullResponse>(`${baseUrl}/pull?afterId=${afterId}`)
+  return requestJson<BarcodeScannerPullResponse>(`${getBaseUrl()}/pull?afterId=${afterId}`)
 }
+import { withApiBase } from './apiBase'

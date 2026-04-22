@@ -1,19 +1,17 @@
-using System.Text;
-using MesScanner.Backend.Hubs;
+﻿using MesScanner.Backend.Hubs;
 using MesScanner.Backend.Models;
 using MesScanner.Backend.Services;
-using Microsoft.AspNetCore.SignalR;
 using ScanModule;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. 注册服务
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<AppConfigFileService>();
 builder.Services.AddSingleton<WindowsDirectoryPickerService>();
 builder.Services.AddSingleton<TorqueControllerService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TorqueControllerService>());
 builder.Services.AddBarcodeScannerModule();
+builder.Services.AddHttpClient();
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -26,17 +24,50 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+var proxyMethods = new[] { "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS" };
 
-// 2. 配置中间件
 app.UseCors("AllowAll");
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 app.MapHub<TorqueHub>("/torqueHub");
+app.MapHub<TorqueHub>("/api/torqueHub");
 app.MapBarcodeScannerModule();
+app.MapGroup("/api").MapBarcodeScannerModule();
 
-// 3. 业务 API
+app.MapMethods("/mes-api/{**path}", proxyMethods, (
+    HttpContext httpContext,
+    string? path,
+    IHttpClientFactory httpClientFactory,
+    AppConfigFileService cfgService) =>
+{
+    return ProxyRequestAsync(
+        httpContext,
+        httpClientFactory.CreateClient(),
+        cfgService.GetMesApiProxyTarget(),
+        path);
+});
+
+app.MapMethods("/mes-push/{**path}", proxyMethods, (
+    HttpContext httpContext,
+    string? path,
+    IHttpClientFactory httpClientFactory,
+    AppConfigFileService cfgService) =>
+{
+    return ProxyRequestAsync(
+        httpContext,
+        httpClientFactory.CreateClient(),
+        cfgService.GetMesPushProxyTarget(),
+        path);
+});
+
 app.MapGet("/", () => "Torque MES Backend Running...");
-app.MapGet("/app-config", (AppConfigFileService cfgService) => Results.Ok(cfgService.GetDto()));
 
-app.MapPost("/app-config", async (
+var getAppConfigHandler = (AppConfigFileService cfgService) => Results.Ok(cfgService.GetDto());
+app.MapGet("/app-config", getAppConfigHandler);
+app.MapGet("/api/app-config", getAppConfigHandler);
+
+var saveAppConfigHandler = async (
     AppConfigDto req,
     AppConfigFileService cfgService,
     TorqueControllerService torqueService) =>
@@ -48,9 +79,11 @@ app.MapPost("/app-config", async (
         config = saved,
         filePath = cfgService.ConfigFilePath
     });
-});
+};
+app.MapPost("/app-config", saveAppConfigHandler);
+app.MapPost("/api/app-config", saveAppConfigHandler);
 
-app.MapPost("/app-config/pick-directory", (DirectoryPickRequest req, WindowsDirectoryPickerService picker) =>
+var pickDirHandler = (DirectoryPickRequest req, WindowsDirectoryPickerService picker) =>
 {
     var path = picker.PickDirectory(req.Title ?? "选择目录");
     if (string.IsNullOrWhiteSpace(path))
@@ -59,40 +92,55 @@ app.MapPost("/app-config/pick-directory", (DirectoryPickRequest req, WindowsDire
     }
 
     return Results.Ok(new { path });
-});
+};
+app.MapPost("/app-config/pick-directory", pickDirHandler);
+app.MapPost("/api/app-config/pick-directory", pickDirHandler);
 
-// 执行定扭相关指令 (前端手动测试用)
-app.MapPost("/command", async (string mid, string pset, TorqueControllerService service) => {
-    // 统一采用 20 字节标准 Header: Length(4)+MID(4)+Rev(3)+NoAck(1)+Station(2)+Spindle(2)+Spare(4)
-    if (mid == "0018") {
-         // MID 0018: Select PSet. Length 23 = Header(20) + PSetID(3)
-         await service.SendPacketAsync($"00230018001         {pset.PadLeft(3, '0')}");
-    } else if (mid == "0043") {
-         await service.SendPacketAsync("00200043001         ");
-    } else if (mid == "0042") {
-         await service.SendPacketAsync("00200042001         ");
-    } else if (mid == "0044") {
-         await service.SendPacketAsync("00200044001         ");
-    } else if (mid == "0060") {
-         await service.SendPacketAsync("00200060001         ");
-    } else if (mid == "0003") {
-         await service.SendPacketAsync("00200003001         ");
-    } else if (mid == "0129") {
-         await service.SendPacketAsync("00200129001         ");
+var commandHandler = async (string mid, string pset, TorqueControllerService service) =>
+{
+    if (mid == "0018")
+    {
+        await service.SendPacketAsync($"00230018001         {pset.PadLeft(3, '0')}");
+    }
+    else if (mid == "0043")
+    {
+        await service.SendPacketAsync("00200043001         ");
+    }
+    else if (mid == "0042")
+    {
+        await service.SendPacketAsync("00200042001         ");
+    }
+    else if (mid == "0044")
+    {
+        await service.SendPacketAsync("00200044001         ");
+    }
+    else if (mid == "0060")
+    {
+        await service.SendPacketAsync("00200060001         ");
+    }
+    else if (mid == "0003")
+    {
+        await service.SendPacketAsync("00200003001         ");
+    }
+    else if (mid == "0129")
+    {
+        await service.SendPacketAsync("00200129001         ");
     }
 
     return Results.Ok();
-});
+};
+app.MapPost("/command", commandHandler);
+app.MapPost("/api/command", commandHandler);
 
-// 获取当前控制器目标地址
-app.MapGet("/controller/config", (TorqueControllerService service) =>
+var getControllerConfigHandler = (TorqueControllerService service) =>
 {
     var endpoint = service.GetControllerEndpoint();
     return Results.Ok(new { ip = endpoint.Ip, port = endpoint.Port });
-});
+};
+app.MapGet("/controller/config", getControllerConfigHandler);
+app.MapGet("/api/controller/config", getControllerConfigHandler);
 
-// 更新控制器目标地址，支持可选立即重连
-app.MapPost("/controller/config", async (
+var saveControllerConfigHandler = async (
     ControllerConfigRequest req,
     TorqueControllerService service,
     AppConfigFileService cfgService) =>
@@ -113,31 +161,33 @@ app.MapPost("/controller/config", async (
     cfg.DesoutterPort = req.Port;
     cfgService.SaveDto(cfg);
     return Results.Ok(new { message = "控制器地址已更新", ip = req.Ip, port = req.Port, reconnect = req.Reconnect });
-});
+};
+app.MapPost("/controller/config", saveControllerConfigHandler);
+app.MapPost("/api/controller/config", saveControllerConfigHandler);
 
-
-// 手动触发重新连接控制器（前端"连接接口"按钮调用）
-app.MapPost("/reconnect", async (TorqueControllerService service) =>
+var reconnectHandler = async (TorqueControllerService service) =>
 {
     await service.TriggerReconnectAsync();
     return Results.Ok();
-});
+};
+app.MapPost("/reconnect", reconnectHandler);
+app.MapPost("/api/reconnect", reconnectHandler);
 
-// 手动断开控制器连接（并关闭自动重连）
-app.MapPost("/disconnect", async (TorqueControllerService service) =>
+var disconnectHandler = async (TorqueControllerService service) =>
 {
     await service.DisconnectAsync();
     return Results.Ok();
-});
+};
+app.MapPost("/disconnect", disconnectHandler);
+app.MapPost("/api/disconnect", disconnectHandler);
 
-// 保存日志到本地文件
-app.MapPost("/saveLogs", async (LogSaveRequest req, AppConfigFileService cfgService) =>
+var saveLogsHandler = async (LogSaveRequest req, AppConfigFileService cfgService) =>
 {
-    try 
+    try
     {
         string savePath = string.IsNullOrEmpty(req.Path) ? cfgService.GetLogSavePath() : req.Path;
         if (!Directory.Exists(savePath)) Directory.CreateDirectory(savePath);
-        
+
         string fullPath = Path.Combine(savePath, req.FileName);
         await File.WriteAllTextAsync(fullPath, req.Content);
         return Results.Ok(new { message = "Save success", path = fullPath });
@@ -146,9 +196,70 @@ app.MapPost("/saveLogs", async (LogSaveRequest req, AppConfigFileService cfgServ
     {
         return Results.Problem(ex.Message);
     }
-});
+};
+app.MapPost("/saveLogs", saveLogsHandler);
+app.MapPost("/api/saveLogs", saveLogsHandler);
+
+app.MapFallbackToFile("index.html");
 
 app.Run();
+
+static async Task<IResult> ProxyRequestAsync(
+    HttpContext context,
+    HttpClient client,
+    string targetBaseUrl,
+    string? path)
+{
+    if (string.IsNullOrWhiteSpace(targetBaseUrl))
+    {
+        return Results.Problem("代理目标地址未配置");
+    }
+
+    var requestUri = BuildProxyUri(targetBaseUrl, path, context.Request.QueryString);
+    using var proxyRequest = new HttpRequestMessage(new HttpMethod(context.Request.Method), requestUri);
+
+    if (context.Request.ContentLength > 0 || context.Request.Headers.ContainsKey("Transfer-Encoding"))
+    {
+        proxyRequest.Content = new StreamContent(context.Request.Body);
+    }
+
+    foreach (var header in context.Request.Headers)
+    {
+        if (string.Equals(header.Key, "Host", StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        if (!proxyRequest.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()))
+        {
+            proxyRequest.Content?.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+        }
+    }
+
+    using var proxyResponse = await client.SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+
+    context.Response.StatusCode = (int)proxyResponse.StatusCode;
+
+    foreach (var header in proxyResponse.Headers)
+    {
+        context.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+    foreach (var header in proxyResponse.Content.Headers)
+    {
+        context.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+
+    context.Response.Headers.Remove("transfer-encoding");
+    await proxyResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
+    return Results.Empty;
+}
+
+static string BuildProxyUri(string targetBaseUrl, string? path, QueryString queryString)
+{
+    var baseUrl = targetBaseUrl.Trim().TrimEnd('/');
+    var relativePath = string.IsNullOrWhiteSpace(path) ? string.Empty : $"/{path.TrimStart('/')}";
+    return $"{baseUrl}{relativePath}{queryString}";
+}
 
 public record LogSaveRequest(string FileName, string Content, string Path);
 public record ControllerConfigRequest(string Ip, int Port, bool Reconnect = false);
