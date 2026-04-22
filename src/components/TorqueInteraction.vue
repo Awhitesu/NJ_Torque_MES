@@ -686,10 +686,6 @@ defineExpose({
 
 <template>
   <div class="torque-panel">
-    <div class="header">
-      <span class="icon">🔧</span> 定扭控制器对接 (Desoutter Open Protocol)
-    </div>
-
     <!-- 顶部连接状态 -->
     <div class="status-bar" :class="{ connected: isConnected }">
       <div class="conn-info">

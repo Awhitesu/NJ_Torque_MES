@@ -86,6 +86,7 @@ const torqueInteractionRef = ref<any>(null)
 const materialScannerRef = ref<any>(null)
 const materialVerificationLoading = ref(false)
 const materialVerificationSuccess = ref(false)
+const tighteningStarted = ref(false)
 const verifiedMaterials = ref<any[]>([])
 const processStartTime = ref(new Date().toLocaleString())
 const scannerRunning = ref(false)
@@ -150,26 +151,43 @@ function updateScannerConnectedStable(next: boolean) {
 
 const globalStatus = computed(() => {
   const msg = resultMessage.value || ''
+  const hasPendingTightening = tighteningTasks.value.some(t => t.result === 'PENDING')
+  const hasOrderAndRoute = !!orderInfo.value && routeSteps.value.length > 0
 
-  if (materialVerificationLoading.value) {
-    return { cls: 'loading-mini', icon: '...', text: '正在向后台提交全物料验证，请稍候...' }
-  }
   if (testResult.value === 'NG' && resultMessage.value) {
     return { cls: 'fail-mini', icon: 'NG', text: `异常: ${resultMessage.value}` }
   }
-  if (msg.includes('报工失败')) {
+  if (msg.includes('报工失败') || msg.includes('报工未完成')) {
     return { cls: 'fail-mini', icon: 'NG', text: `异常: ${msg}` }
   }
+
+  if (orderLoading.value) {
+    return { cls: 'loading-mini', icon: '', text: '正在获取工单，请稍候...' }
+  }
+  if (routeLoading.value) {
+    return { cls: 'loading-mini', icon: '', text: '正在获取工步，请稍候...' }
+  }
+  if (materialVerificationLoading.value) {
+    return { cls: 'loading-mini', icon: '', text: '正在向后台提交全物料验证，请稍候...' }
+  }
+
   if (msg.includes('报工已成功') || msg.includes('流程已全部完成') || msg.includes('报工完成')) {
     return { cls: 'success-mini', icon: 'OK', text: '报工完成' }
   }
   if (testResult.value === 'OK' && msg.includes('正在备份日志并报工')) {
-    return { cls: 'loading-mini', icon: '...', text: '定扭完成，正在报工...' }
+    return { cls: 'loading-mini', icon: '', text: '定扭完成，正在报工...' }
+  }
+
+  if (materialVerificationSuccess.value && tighteningStarted.value && hasPendingTightening) {
+    return { cls: 'loading-mini', icon: '', text: '正在定扭...' }
   }
   if (materialVerificationSuccess.value) {
-    return { cls: 'loading-mini', icon: '...', text: '正在定扭...' }
+    return { cls: 'success-mini', icon: 'OK', text: '全物料后台验证已通过，即将进入定扭环节...' }
   }
-  return null
+  if (hasOrderAndRoute) {
+    return { cls: 'loading-mini', icon: '', text: '等待单物料扫码' }
+  }
+  return { cls: 'loading-mini', icon: '', text: '等待扫码...' }
 })
 
 async function loadConfigFromFile() {
@@ -319,6 +337,7 @@ function resetAll() {
   apiRecords.value = [];
   materialVerificationSuccess.value = false;
   materialVerificationLoading.value = false;
+  tighteningStarted.value = false;
 }
 
 async function handleScan() {
@@ -497,6 +516,7 @@ async function handleMaterialComplete(materials: { productCode: string, productC
 
 function startTighteningWorkflow() {
   addLog('info', '[流程] 正在激活定扭交互组件...')
+  tighteningStarted.value = true
   activeTab.value = 'torque'
   if (torqueInteractionRef.value) {
     torqueInteractionRef.value.executeNextPendingTask()
@@ -561,6 +581,15 @@ async function submitAllDataToMes(): Promise<boolean> {
   const t0 = Date.now()
   const nowStr = new Date().toLocaleDateString()
   const endTimeStr = new Date().toLocaleString()
+  const currentProductCode = String(productCode.value || '').trim()
+  const allTighteningOk = tighteningTasks.value.every(t => t.result === 'PASS')
+  const overallProductQuality = allTighteningOk ? 1 : 0
+  const produceInEntityList = verifiedMaterials.value
+    .filter((m: any) => String(m?.productCode || '').trim() !== currentProductCode)
+    .map((m: any) => ({
+      productCode: String(m?.productCode || '').trim(),
+      ProductCount: 1
+    }))
   
   // 1. 鏋勫缓鐗╂枡缁戝畾姝?(STEP1)
   const step1Payload = {
@@ -568,11 +597,11 @@ async function submitAllDataToMes(): Promise<boolean> {
     routeNo: orderInfo.value.route_No || orderInfo.value.routeNo || '',
     technicsProcessCode: config.technicsProcessCode,
     technicsProcessName: config.technicsProcessName || '',
-    technicsStepCode: "STEP1",
-    technicsStepName: "物料绑定",
-    productCode: productCode.value,
-    productCount: verifiedMaterials.value.length,
-    productQuality: 0,
+      technicsStepCode: "STEP1",
+      technicsStepName: "物料绑定",
+      productCode: productCode.value,
+      productCount: 1,
+    productQuality: overallProductQuality,
     produceDate: nowStr,
     startTime: processStartTime.value,
     endTime: endTimeStr,
@@ -580,10 +609,7 @@ async function submitAllDataToMes(): Promise<boolean> {
     userAccount: config.userAccount || currentUser.value?.username || "admin",
     deviceCode: config.deviceCode || "",
     Remarks: "",
-    ProduceInEntityList: verifiedMaterials.value.map(m => ({
-      productCode: m.productCode,
-      ProductCount: m.productCount
-    })),
+    ProduceInEntityList: produceInEntityList,
     produceParamEntityList: [],
     ngEntityList: [],
     cellParamEntityList: [],
@@ -608,8 +634,8 @@ async function submitAllDataToMes(): Promise<boolean> {
       technicsStepCode: stepNo, // 鍋囪鎺ュ彛浜岃繑鍥炵殑 workseqNo 瀵瑰簲 STEP2, STEP3...
       technicsStepName: tasks[0].workstepName,
       productCode: productCode.value,
-      productCount: tasks.length,
-      productQuality: tasks.every(t => t.result === 'PASS') ? 0 : 1,
+      productCount: 1,
+      productQuality: tasks.every(t => t.result === 'PASS') ? 1 : 0,
       produceDate: nowStr,
       startTime: processStartTime.value,
       endTime: endTimeStr,
@@ -806,6 +832,7 @@ async function executeReset() {
   routeSteps.value = []
   materialVerificationSuccess.value = false
   materialVerificationLoading.value = false
+  tighteningStarted.value = false
   manualCommandAuthorized.value = false
   testResult.value = 'IDLE'
   resultMessage.value = ''
@@ -950,7 +977,7 @@ function requestManualCommandAuth() {
 
       <section class="right-panel">
         <div v-if="globalStatus" class="global-status status-banner" :class="globalStatus.cls">
-          <span class="global-status-icon">{{ globalStatus.icon }}</span>
+          <span v-if="globalStatus.icon" class="global-status-icon">{{ globalStatus.icon }}</span>
           <span>{{ globalStatus.text }}</span>
         </div>
         <!-- 鏍囩鏍?-->
@@ -1009,7 +1036,8 @@ function requestManualCommandAuth() {
           <div v-show="activeTab === 'material'" class="tab-pane material-pane">
             <MaterialScanner 
               ref="materialScannerRef"
-              :steps="routeSteps" 
+              :steps="routeSteps"
+              :product-code="productCode"
               @log="addLog"
               @single-complete="handleSingleMaterialScan"
               @complete="handleMaterialComplete"
@@ -1829,6 +1857,12 @@ kbd {
   flex: 1;
   min-height: 420px;
   display: flex;
+  width: 100%;
+}
+
+.torque-interaction-wrap > * {
+  flex: 1;
+  min-width: 0;
 }
 
 .matrix-header-modern {

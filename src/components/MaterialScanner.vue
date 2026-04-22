@@ -1,9 +1,10 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { RouteStep, WorkStep } from '../types/mes'
 
 const props = defineProps<{
   steps: RouteStep[]
+  productCode?: string
 }>()
 
 const emit = defineEmits<{
@@ -12,7 +13,6 @@ const emit = defineEmits<{
   (e: 'log', level: 'info'|'success'|'warn'|'error', msg: string): void
 }>()
 
-// 需要扫描的物料任务项
 export interface MaterialTask {
   uid: string
   seqIdx: number
@@ -28,20 +28,59 @@ export interface MaterialTask {
 
 const taskList = ref<MaterialTask[]>([])
 const lastScannedCode = ref('')
+const autoBoundMaterials = ref<{ productCode: string, productCount: number }[]>([])
+const completionEmitted = ref(false)
 
-// 提取所有物料，生成任务列表
+function isBarcodeMatchMaterial(barcode: string, materialNo: string, noLength: number): boolean {
+  if (!barcode || !materialNo) return false
+  if (noLength > 0 && barcode.length !== noLength) return false
+  return barcode.startsWith(materialNo)
+}
+
+function buildCompletePayload() {
+  const scannedPayload = taskList.value.flatMap(t =>
+    t.scannedBarcodes.map(code => ({
+      productCode: code,
+      productCount: 1
+    }))
+  )
+  return [...scannedPayload, ...autoBoundMaterials.value]
+}
+
+function tryEmitComplete() {
+  if (completionEmitted.value) return
+  const visibleDone = taskList.value.length === 0 || taskList.value.every(t => t.status === 'completed')
+  if (!visibleDone) return
+
+  const payload = buildCompletePayload()
+  if (!payload.length) return
+  completionEmitted.value = true
+  emit('complete', payload)
+}
+
 function buildTasks() {
   const tasks: MaterialTask[] = []
   let uidCounter = 0
-  
+  const autoMats: { productCode: string, productCount: number }[] = []
+  const currentProductCode = String(props.productCode || '').trim()
+  completionEmitted.value = false
+
   props.steps.forEach((seq, si) => {
     const wsList = (seq.workStepList as WorkStep[]) || []
     wsList.forEach((ws) => {
       const matList = (ws.workStepMaterialList as any[]) || []
       matList.forEach((mat) => {
-        // 如果数量为0或没有返回物料编号，跳过
         const reqNum = Number(mat.material_number) || 0
         if (!mat.material_No || reqNum <= 0) return
+        const noLength = Number(mat.noLength) || 0
+
+        // 与产品条码匹配的物料，不在列表显示，但需要参与后续上传。
+        if (currentProductCode && isBarcodeMatchMaterial(currentProductCode, mat.material_No, noLength)) {
+          for (let i = 0; i < reqNum; i++) {
+            autoMats.push({ productCode: currentProductCode, productCount: 1 })
+          }
+          return
+        }
 
         tasks.push({
           uid: `mat-${uidCounter++}`,
@@ -49,7 +88,7 @@ function buildTasks() {
           material_No: mat.material_No,
           material_Name: mat.material_Name || '',
           material_number: reqNum,
-          noLength: Number(mat.noLength) || 0,
+          noLength,
           retrospect_Type: mat.retrospect_Type,
           scannedCount: 0,
           scannedBarcodes: [],
@@ -58,13 +97,18 @@ function buildTasks() {
       })
     })
   })
-  
+
   taskList.value = tasks
+  autoBoundMaterials.value = autoMats
+
+  if (autoMats.length > 0) {
+    autoMats.forEach(item => emit('single-complete', item))
+  }
+  tryEmitComplete()
 }
 
-// 监听工步数据变化，重新构建任务
 watch(
-  () => props.steps,
+  () => [props.steps, props.productCode],
   () => {
     buildTasks()
   },
@@ -72,57 +116,56 @@ watch(
 )
 
 const isAllCompleted = computed(() => {
-  if (taskList.value.length === 0) return false
-  return taskList.value.every(t => t.status === 'completed')
+  const visibleDone = taskList.value.length === 0 || taskList.value.every(t => t.status === 'completed')
+  return visibleDone && buildCompletePayload().length > 0
 })
-
-
 
 function handleIncomingCode(rawCode: string) {
   const code = rawCode.trim()
   if (!code) return
   lastScannedCode.value = code
 
-  // 匹配逻辑：
-  // 1. 还没完成的 (status === 'pending')
-  // 2. 长度与 noLength 相等（如果 noLength > 0，这里假设必须精确匹配；若无要求则忽略长度）
-  // 3. 前多少位与 material_No 一致
-  
-  const target = taskList.value.find(t => {
-    if (t.status === 'completed') return false
-    // 长度校验
+  const isCodeMatchTask = (t: MaterialTask) => {
     if (t.noLength > 0 && code.length !== t.noLength) return false
-    // 前缀匹配
     if (!code.startsWith(t.material_No)) return false
     return true
+  }
+
+  // 重复扫码：
+  // 1) 同一个条码已扫过；
+  // 2) 该物料已达到需求数后再次扫码。
+  const matchedTask = taskList.value.find(t => isCodeMatchTask(t))
+  if (matchedTask) {
+    const scannedSameCode = matchedTask.scannedBarcodes.includes(code)
+    const reachedRequired = matchedTask.scannedCount >= matchedTask.material_number
+    if (scannedSameCode || reachedRequired) {
+      emit('log', 'error', `扫码重复: ${matchedTask.material_Name || matchedTask.material_No} 已达到需求数(${matchedTask.material_number})`)
+      lastScannedCode.value = ''
+      return
+    }
+  }
+
+  const target = taskList.value.find(t => {
+    if (t.status === 'completed') return false
+    return isCodeMatchTask(t)
   })
 
   if (target) {
     target.scannedCount++
     target.scannedBarcodes.push(code)
-    
+
     if (target.scannedCount >= target.material_number) {
       target.status = 'completed'
       emit('log', 'success', `物料扫描匹配成功: ${target.material_Name} (全部完成)`)
     } else {
       emit('log', 'success', `物料扫描匹配成功: ${target.material_Name} (${target.scannedCount}/${target.material_number})`)
     }
-    
-    // 发送单次验证记录事件
+
     emit('single-complete', { productCode: code, productCount: 1 })
 
-    
-    // 检查是否全局完成
     if (isAllCompleted.value) {
       emit('log', 'success', '🎉 所有物料验证已全部通过！')
-      
-      const payloadMats = taskList.value.flatMap(t => 
-        t.scannedBarcodes.map(code => ({
-          productCode: code,
-          productCount: 1
-        }))
-      )
-      emit('complete', payloadMats) // 通知主界面并传递物料清单
+      tryEmitComplete()
     }
   } else {
     emit('log', 'error', `扫码无匹配物料或该物料已扫完: ${code}`)
@@ -143,23 +186,20 @@ defineExpose({
         <span class="icon">🔫</span>
         <div class="scanner-only-text">
           扫码枪监听中（已禁用人工输入）
-          <span v-if="lastScannedCode" class="last-code">最近扫码: {{ lastScannedCode }}</span>
         </div>
       </div>
-      
-      <div class="progress-status" v-if="taskList.length">
-        状态: 
+
+      <div v-if="taskList.length" class="progress-status">
+        状态:
         <span v-if="isAllCompleted" class="status-all-done">✅ 全部验证通过</span>
         <span v-else class="status-pending">⏳ 等待验证 ({{ taskList.filter(t => t.status === 'completed').length }}/{{ taskList.length }})</span>
       </div>
     </div>
 
-    <!-- 空状态 -->
     <div v-if="!taskList.length" class="empty-state">
       当前工步无物料绑定信息，无需扫描验证。
     </div>
 
-    <!-- 任务清单表格 -->
     <div v-else class="table-scroll">
       <table>
         <thead>
@@ -176,8 +216,8 @@ defineExpose({
           </tr>
         </thead>
         <tbody>
-          <tr 
-            v-for="(task, idx) in taskList" 
+          <tr
+            v-for="(task, idx) in taskList"
             :key="task.uid"
             class="data-row"
             :class="{ 'done-row': task.status === 'completed' }"
@@ -190,23 +230,22 @@ defineExpose({
             <td class="center req-num">{{ task.material_number }}</td>
             <td class="center">{{ task.noLength > 0 ? task.noLength : '—' }}</td>
             <td class="center">{{ task.retrospect_Type ?? '—' }}</td>
-            
+
             <td class="center">
               <span class="scan-count" :class="{ 'full': task.scannedCount >= task.material_number, 'partial': task.scannedCount > 0 && task.scannedCount < task.material_number }">
                 {{ task.scannedCount }}
               </span>
             </td>
-            
+
             <td class="center">
-               <span v-if="task.status === 'completed'" class="status-tag success">通过</span>
-               <span v-else class="status-tag pending">待扫</span>
+              <span v-if="task.status === 'completed'" class="status-tag success">通过</span>
+              <span v-else class="status-tag pending">待扫</span>
             </td>
-            
-            <!-- 显示匹配到的条码，多个就折行 -->
+
             <td class="barcodes-cell mono small">
-               <div v-for="(code, i) in task.scannedBarcodes" :key="i" class="code-item">
-                 {{ code }}
-               </div>
+              <div v-for="(code, i) in task.scannedBarcodes" :key="i" class="code-item">
+                {{ code }}
+              </div>
             </td>
           </tr>
         </tbody>
@@ -258,13 +297,6 @@ defineExpose({
   color: #e3f2fd;
   font-size: 18px;
   font-weight: 600;
-}
-
-.last-code {
-  color: #80cbc4;
-  font-family: 'Consolas', monospace;
-  font-size: 18px;
-  font-weight: 500;
 }
 
 .progress-status {
