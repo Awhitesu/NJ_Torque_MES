@@ -23,6 +23,7 @@
   },
   "System": {
     "LogSavePath": "D:\\NJ_Torque_Logs",
+    "TighteningMaxRetries": 3,
     "AdminUsername": "admin",
     "AdminPassword": "123"
   }

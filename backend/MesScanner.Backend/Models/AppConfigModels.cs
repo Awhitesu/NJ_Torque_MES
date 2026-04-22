@@ -22,6 +22,7 @@ public class AppConfigDto
     public string BarcodeRegex { get; set; } = string.Empty;
 
     public string LogSavePath { get; set; } = string.Empty;
+    public int TighteningMaxRetries { get; set; } = 3;
     public string AdminUsername { get; set; } = string.Empty;
     public string AdminPassword { get; set; } = string.Empty;
 }
@@ -65,6 +66,7 @@ public class AppRuntimeFileConfig
             System = new SystemSection
             {
                 LogSavePath = @"C:\NJ_Torque_Logs",
+                TighteningMaxRetries = 3,
                 AdminUsername = "admin",
                 AdminPassword = "123"
             }
@@ -103,6 +105,7 @@ public class ScannerSection
 public class SystemSection
 {
     public string LogSavePath { get; set; } = string.Empty;
+    public int TighteningMaxRetries { get; set; } = 3;
     public string AdminUsername { get; set; } = string.Empty;
     public string AdminPassword { get; set; } = string.Empty;
 }

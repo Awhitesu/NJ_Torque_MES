@@ -118,6 +118,7 @@ public class AppConfigFileService
         cfg.Scanner.BarcodeRegex = KeepOrDefault(cfg.Scanner.BarcodeRegex, d.Scanner.BarcodeRegex);
 
         cfg.System.LogSavePath = KeepOrDefault(cfg.System.LogSavePath, d.System.LogSavePath);
+        cfg.System.TighteningMaxRetries = NormalizeRetryCount(cfg.System.TighteningMaxRetries, d.System.TighteningMaxRetries);
         cfg.System.AdminUsername = KeepOrDefault(cfg.System.AdminUsername, d.System.AdminUsername);
         cfg.System.AdminPassword = KeepOrDefault(cfg.System.AdminPassword, d.System.AdminPassword);
         return cfg;
@@ -127,6 +128,12 @@ public class AppConfigFileService
     {
         var v = raw?.Trim();
         return string.IsNullOrWhiteSpace(v) ? fallback : v;
+    }
+
+    private static int NormalizeRetryCount(int raw, int fallback)
+    {
+        var candidate = raw > 0 ? raw : fallback;
+        return Math.Clamp(candidate, 1, 20);
     }
 
     private static AppConfigDto ToDto(AppRuntimeFileConfig cfg)
@@ -150,6 +157,7 @@ public class AppConfigFileService
             ScannerPort = cfg.Scanner.Port,
             BarcodeRegex = cfg.Scanner.BarcodeRegex,
             LogSavePath = cfg.System.LogSavePath,
+            TighteningMaxRetries = cfg.System.TighteningMaxRetries,
             AdminUsername = cfg.System.AdminUsername,
             AdminPassword = cfg.System.AdminPassword
         };
@@ -187,6 +195,7 @@ public class AppConfigFileService
             System = new SystemSection
             {
                 LogSavePath = dto.LogSavePath,
+                TighteningMaxRetries = dto.TighteningMaxRetries,
                 AdminUsername = dto.AdminUsername,
                 AdminPassword = dto.AdminPassword
             }

@@ -31,6 +31,11 @@ watch(
 )
 
 function handleSave() {
+  const retryRaw = Number(form.tighteningMaxRetries)
+  form.tighteningMaxRetries = Number.isFinite(retryRaw)
+    ? Math.min(20, Math.max(1, Math.floor(retryRaw)))
+    : 3
+
   emit('update:modelValue', { ...form })
   emit('save')
   emit('update:visible', false)
@@ -78,6 +83,19 @@ async function handlePickLogPath() {
               </button>
             </div>
             <small>目录选择窗口从最顶层开始显示，优先便于快速选择目标目录。</small>
+          </div>
+
+          <div class="field-group">
+            <label>定扭失败最大重试次数</label>
+            <input
+              v-model.number="form.tighteningMaxRetries"
+              type="number"
+              min="1"
+              max="20"
+              placeholder="3"
+              class="input-field"
+            />
+            <small>达到该次数后流程停止，等待人工复位。</small>
           </div>
 
           <div class="field-groups-row" style="display: flex; gap: 16px; margin-top: 10px;">

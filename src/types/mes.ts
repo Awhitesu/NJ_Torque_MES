@@ -33,6 +33,8 @@ export interface AppConfig {
   barcodeRegex: string
   /** 日志保存路径 */
   logSavePath?: string
+  /** 定扭失败最大重试次数 */
+  tighteningMaxRetries?: number
   /** 管理员用户名 */
   adminUsername?: string
   /** 管理员密码 */

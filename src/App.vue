@@ -33,6 +33,7 @@ const DEFAULT_CONFIG: AppConfig = {
   barcodeRegex: '.*',
 
   logSavePath: 'C:\\NJ_Torque_Logs',
+  tighteningMaxRetries: 3,
   adminUsername: 'admin',
   adminPassword: '123'
 }
@@ -148,14 +149,25 @@ function updateScannerConnectedStable(next: boolean) {
 }
 
 const globalStatus = computed(() => {
+  const msg = resultMessage.value || ''
+
   if (materialVerificationLoading.value) {
     return { cls: 'loading-mini', icon: '...', text: '正在向后台提交全物料验证，请稍候...' }
   }
-  if (materialVerificationSuccess.value) {
-    return { cls: 'success-mini', icon: 'OK', text: '全物料后台验证已通过，即将进入定扭环节...' }
-  }
   if (testResult.value === 'NG' && resultMessage.value) {
     return { cls: 'fail-mini', icon: 'NG', text: `异常: ${resultMessage.value}` }
+  }
+  if (msg.includes('报工失败')) {
+    return { cls: 'fail-mini', icon: 'NG', text: `异常: ${msg}` }
+  }
+  if (msg.includes('报工已成功') || msg.includes('流程已全部完成') || msg.includes('报工完成')) {
+    return { cls: 'success-mini', icon: 'OK', text: '报工完成' }
+  }
+  if (testResult.value === 'OK' && msg.includes('正在备份日志并报工')) {
+    return { cls: 'loading-mini', icon: '...', text: '定扭完成，正在报工...' }
+  }
+  if (materialVerificationSuccess.value) {
+    return { cls: 'loading-mini', icon: '...', text: '正在定扭...' }
   }
   return null
 })
@@ -494,7 +506,7 @@ function startTighteningWorkflow() {
 }
 
 function handleTaskFailed(failedTask: TighteningTask) {
-  const MAX_RETRIES = 3
+  const MAX_RETRIES = Math.min(20, Math.max(1, Math.floor(Number(config.tighteningMaxRetries || 3))))
   
   const task = tighteningTasks.value.find(t => t.id === failedTask.id)
   if (!task) return
@@ -506,25 +518,18 @@ function handleTaskFailed(failedTask: TighteningTask) {
   addLog('error', `[流程] ${task.itemDisplayName} 拧紧失败，当前尝试次数: ${task.retryCount}`)
 
   if (task.retryCount < MAX_RETRIES) {
-    const wantRetry = confirm(`螺丝拧紧失败。\n螺丝: ${task.itemDisplayName}\n当前重试次数: ${task.retryCount} / ${MAX_RETRIES}\n\n点击“确定”重试当前螺丝；点击“取消”跳过并继续下一颗。`)
-    
-    if (wantRetry) {
-      task.result = 'PENDING'
-      task.actualTorque = null
-      task.actualAngle = null
-      
-      testResult.value = 'IDLE'
-      resultMessage.value = `正在重试: ${task.itemDisplayName}...`
-      
-      addLog('info', `[流程] 用户选择重试螺丝: ${task.itemDisplayName}`)
-      if (torqueInteractionRef.value) {
-        torqueInteractionRef.value.executeNextPendingTask()
-      }
-    } else {
-      addLog('warn', `[流程] 用户选择跳过失败螺丝: ${task.itemDisplayName}`)
-      if (torqueInteractionRef.value) {
-        torqueInteractionRef.value.resumeTighteningWorkflow()
-      }
+    alert(`螺丝拧紧失败。\n螺丝: ${task.itemDisplayName}\n当前重试次数: ${task.retryCount} / ${MAX_RETRIES}\n\n请处理现场后点击“确定”重试当前螺丝。`)
+
+    task.result = 'PENDING'
+    task.actualTorque = null
+    task.actualAngle = null
+
+    testResult.value = 'IDLE'
+    resultMessage.value = `已确认重试: ${task.itemDisplayName}，2秒后重新下发工步...`
+
+    addLog('info', `[流程] 失败弹窗确认，准备重试螺丝: ${task.itemDisplayName}`)
+    if (torqueInteractionRef.value) {
+      torqueInteractionRef.value.resumeTighteningWorkflow()
     }
   } else {
     alert(`定扭失败次数达到上限 (${MAX_RETRIES}次)\n螺丝: ${task.itemDisplayName}\n流程将停止，请手动复位。`)
@@ -624,28 +629,28 @@ async function submitAllDataToMes(): Promise<boolean> {
             technicsParamCode: "DN0001",
             technicsParamValue: t.actualTorque || "0",
             desc: "定扭扭矩",
-            technicsParamQuality: t.result === 'PASS' ? "0" : "1"
+            technicsParamQuality: t.result === 'PASS' ? "1" : "0"
           },
           {
             technicsParamName: "定扭角度",
             technicsParamCode: "DN0002",
             technicsParamValue: t.actualAngle || "0",
             desc: "定扭角度",
-            technicsParamQuality: t.result === 'PASS' ? "0" : "1"
+            technicsParamQuality: t.result === 'PASS' ? "1" : "0"
           },
           {
             technicsParamName: "程序号",
             technicsParamCode: "DN0005",
             technicsParamValue: t.pSetNo,
             desc: "程序号",
-            technicsParamQuality: "0"
+            technicsParamQuality: t.result === 'PASS' ? "1" : "0"
           },
           {
             technicsParamName: "定扭时间",
             technicsParamCode: "DN0007",
             technicsParamValue: t.timestamp || endTimeStr,
             desc: "定扭时间",
-            technicsParamQuality: "0"
+            technicsParamQuality: t.result === 'PASS' ? "1" : "0"
           }
         ]
       })),
@@ -896,25 +901,20 @@ function requestManualCommandAuth() {
           <div v-else-if="orderInfo" class="info-grid">
             <div class="info-item">
               <span class="info-label">工单号</span>
-              <span class="info-value highlight">{{ orderInfo.orderCode }}</span>
+              <span class="info-value highlight">{{ orderInfo.orderCode || orderInfo.order_Code || '—' }}</span>
             </div>
             <div class="info-item">
               <span class="info-label">工艺路线编码 (route_No)</span>
-              <span class="info-value mono">{{ orderInfo.route_No }}</span>
+              <span class="info-value mono">{{ orderInfo.route_No || orderInfo.routeNo || '—' }}</span>
             </div>
             <div class="info-item">
               <span class="info-label">产品条码</span>
               <span class="info-value mono">{{ productCode }}</span>
             </div>
-            <template v-for="(val, key) in orderInfo" :key="key">
-              <div
-                v-if="key !== 'orderCode' && key !== 'route_No'"
-                class="info-item"
-              >
-                <span class="info-label">{{ key }}</span>
-                <span class="info-value">{{ val }}</span>
-              </div>
-            </template>
+            <div class="info-item">
+              <span class="info-label">工序名称</span>
+              <span class="info-value">{{ config.technicsProcessName || config.technicsProcessCode || '—' }}</span>
+            </div>
           </div>
 
           <div v-else class="empty-hint">等待扫码查询...</div>
@@ -1014,13 +1014,13 @@ function requestManualCommandAuth() {
               @single-complete="handleSingleMaterialScan"
               @complete="handleMaterialComplete"
             />
+          </div>
 
-
-            <!-- 瀹氭壄鍒ゅ畾鐭╅樀琛ㄦ牸 (宸叉寜闇€绉诲姩鑷崇墿鏂欎笅鏂? -->
+          <!-- 瀹氭壄浜や簰 -->
+          <div v-show="activeTab === 'torque'" class="tab-pane torque-pane">
             <div class="tightening-matrix-card-modern">
               <div class="matrix-header-modern">
                 <span class="matrix-title">定扭判定矩阵 (基于工单工步自动展开)</span>
-                <button class="btn-text-modern" @click="tighteningTasks.forEach(t => { t.actualTorque = null; t.actualAngle = null; t.result = 'PENDING'; })">重置进度</button>
               </div>
               <div class="matrix-table-wrap">
                 <table class="matrix-table-modern">
@@ -1070,21 +1070,19 @@ function requestManualCommandAuth() {
                 </table>
               </div>
             </div>
-          </div>
-
-          <!-- 瀹氭壄浜や簰 -->
-          <div v-show="activeTab === 'torque'" class="tab-pane">
-            <TorqueInteraction 
-              ref="torqueInteractionRef"
-              :ip="config.desoutterIp"
-              :port="config.desoutterPort"
-              :manual-command-authorized="manualCommandAuthorized"
-              v-model:tasks="tighteningTasks"
-              @log="addLog"
-              @taskFailed="handleTaskFailed"
-              @allTasksComplete="handleAllTasksComplete"
-              @request-manual-auth="requestManualCommandAuth"
-            />
+            <div class="torque-interaction-wrap">
+              <TorqueInteraction 
+                ref="torqueInteractionRef"
+                :ip="config.desoutterIp"
+                :port="config.desoutterPort"
+                :manual-command-authorized="manualCommandAuthorized"
+                v-model:tasks="tighteningTasks"
+                @log="addLog"
+                @taskFailed="handleTaskFailed"
+                @allTasksComplete="handleAllTasksComplete"
+                @request-manual-auth="requestManualCommandAuth"
+              />
+            </div>
           </div>
 
           <!-- 鎺ュ彛浜や簰璇︽儏 -->
@@ -1203,20 +1201,23 @@ function requestManualCommandAuth() {
 .process-badge {
   background: rgba(21, 101, 192, 0.2);
   border: 1px solid rgba(100, 181, 246, 0.2);
-  border-radius: 20px;
-  padding: 4px 16px;
-  font-size: 12px;
+  border-radius: 24px;
+  padding: 6px 18px;
+  font-size: 13px;
   display: flex;
-  gap: 6px;
+  gap: 8px;
 }
 
 .process-badge .label {
   color: #78909c;
+  font-size: 13px;
 }
 
 .process-badge .value {
   color: #42a5f5;
-  font-weight: 600;
+  font-weight: 700;
+  font-size: 16px;
+  line-height: 1;
 }
 
 .header-right {
@@ -1356,6 +1357,11 @@ function requestManualCommandAuth() {
 
 .material-pane {
   min-height: 0;
+}
+
+.torque-pane {
+  gap: 10px;
+  overflow: auto;
 }
 
 .log-pane {
@@ -1809,12 +1815,20 @@ kbd {
 
 /* 瀹氭壄鍒ゅ畾鐭╅樀 */
 .tightening-matrix-card-modern {
-  margin-top: 16px;
+  margin-top: 0;
   border-top: 1px solid rgba(100, 181, 246, 0.1);
   display: flex;
   flex-direction: column;
+  flex: 0 0 auto;
+  min-height: 220px;
+  max-height: 320px;
+  overflow: hidden;
+}
+
+.torque-interaction-wrap {
   flex: 1;
-  min-height: 0;
+  min-height: 420px;
+  display: flex;
 }
 
 .matrix-header-modern {

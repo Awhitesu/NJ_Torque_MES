@@ -68,6 +68,7 @@ interface CommandWaiter {
 }
 
 const commandWaiters = new Map<string, CommandWaiter>()
+let commandQueue: Promise<void> = Promise.resolve()
 
 onMounted(() => {
   void initSignalR()
@@ -232,11 +233,22 @@ async function syncControllerConfig(reconnect: boolean) {
   }
 }
 
-function clearCommandWaiter(targetMid: string) {
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function enqueueCommand<T>(job: () => Promise<T>): Promise<T> {
+  const run = commandQueue.then(job, job)
+  commandQueue = run.then(() => undefined, () => undefined)
+  return run
+}
+
+function clearCommandWaiter(targetMid: string, reason = 'replaced by new waiter') {
   const waiter = commandWaiters.get(targetMid)
   if (!waiter) return
   clearTimeout(waiter.timer)
   commandWaiters.delete(targetMid)
+  waiter.reject(new Error(`MID ${targetMid} waiter canceled: ${reason}`))
 }
 
 function resolveCommandWaiter(targetMid: string, result: CommandAckResult) {
@@ -280,10 +292,43 @@ async function sendCommandAndWaitAck(options: {
   expectedRxMids: string[]
   timeoutMs?: number
 }) {
-  const targetMid = options.targetMid || options.mid
-  const ackPromise = waitForCommandAck(targetMid, options.expectedRxMids, options.timeoutMs ?? 3000)
-  await sendCommandToBackend(options.mid, options.pset || '')
-  return ackPromise
+  return enqueueCommand(async () => {
+    const targetMid = options.targetMid || options.mid
+    const ackPromise = waitForCommandAck(targetMid, options.expectedRxMids, options.timeoutMs ?? 3000)
+    await sendCommandToBackend(options.mid, options.pset || '')
+    return ackPromise
+  })
+}
+
+async function sendPSetWithRetry(psetVal: string, context: '手动' | '流程') {
+  const maxAttempts = 2
+  let lastErr: unknown = null
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await sendCommandAndWaitAck({
+        mid: '0018',
+        pset: psetVal,
+        targetMid: '0018',
+        expectedRxMids: ['0005', '0019'],
+        timeoutMs: 5000
+      })
+      if (attempt > 1) {
+        logLocal('success', `[${context}] PSet ${psetVal} 第${attempt}次下发确认成功`)
+      }
+      return
+    } catch (err: any) {
+      lastErr = err
+      const msg = err?.message || String(err)
+      const shouldRetry = attempt < maxAttempts && msg.includes('ack timeout')
+      if (!shouldRetry) throw err
+
+      logLocal('warn', `[${context}] PSet ${psetVal} 确认超时，准备重试 (${attempt}/${maxAttempts})`)
+      await sleep(600)
+    }
+  }
+
+  throw (lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'PSet ack failed')))
 }
 
 function handleRxPayloadForAck(rawPayload: string) {
@@ -444,13 +489,7 @@ async function sendPSet() {
   const psetVal = targetPSet.value.toString().padStart(3, '0')
   try {
     statusText.value = `正在下载 PSet ${psetVal}...`
-    await sendCommandAndWaitAck({
-      mid: '0018',
-      pset: psetVal,
-      targetMid: '0018',
-      expectedRxMids: ['0005', '0019'],
-      timeoutMs: 3500
-    })
+    await sendPSetWithRetry(psetVal, '手动')
     isPSetSet.value = true
     logLocal('success', `[System] PSet ${psetVal} 已确认`)
   } catch (err: any) {
@@ -546,17 +585,11 @@ async function executeNextPendingTask() {
     logLocal('info', `[Flow] Prepare task ${task.itemDisplayName}, PSet ${psetVal}`)
     targetPSet.value = psetVal
 
-    await sendCommandAndWaitAck({
-      mid: '0018',
-      pset: psetVal,
-      targetMid: '0018',
-      expectedRxMids: ['0005', '0019'],
-      timeoutMs: 3500
-    })
+    await sendPSetWithRetry(psetVal, '流程')
     isPSetSet.value = true
     statusText.value = `PSet 下发完成: ${psetVal}`
 
-    await new Promise(r => setTimeout(r, 200))
+    await sleep(200)
 
     await sendCommandAndWaitAck({
       mid: '0043',
@@ -609,13 +642,15 @@ async function handleTaskResult(task: TighteningTask) {
   }
 
   if (task.result === 'FAIL') {
+    statusText.value = '当前螺丝NOK，工具已锁定，等待人工确认...'
+    workflowStatus.value = `人工处理中: ${task.itemDisplayName} (${task.workstepName})`
     logLocal('warn', '[Flow] Tightening failed, waiting for manual handling')
     emit('taskFailed', task)
     return
   }
 
   logLocal('info', '[Flow] Tightening passed, continue after 2s')
-  await new Promise(r => setTimeout(r, 2000))
+  await sleep(2000)
   void executeNextPendingTask()
 }
 
@@ -635,7 +670,7 @@ defineExpose({
   },
   resumeTighteningWorkflow: async () => {
     logLocal('info', '[Flow] Manual confirmation done, continue after 2s')
-    await new Promise(r => setTimeout(r, 2000))
+    await sleep(2000)
     void executeNextPendingTask()
   },
   resetWorkflow: () => {
